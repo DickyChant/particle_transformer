@@ -27,10 +27,25 @@ samples_per_epoch=$((10000 * 1024 / $NGPUS))
 samples_per_epoch_val=$((10000 * 128))
 dataopts="--num-workers 2 --fetch-step 0.01"
 
-# PN, PFN, PCNN, ParT
+# PN, PFN, PCNN, ParT, ParT_gated, ParT_addnodes, ParT_no_mask, ParT_no_mask_aug, ParT_gated_no_mask
 model=$1
 if [[ "$model" == "ParT" ]]; then
     modelopts="networks/example_ParticleTransformer.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParT_gated" ]]; then
+    modelopts="networks/example_ParticleTransformer_gated.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParT_gated_no_mask" ]]; then
+    modelopts="networks/example_ParticleTransformer_gated_no_mask.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParT_addnodes" ]]; then
+    modelopts="networks/example_ParticleTransformer_addnodes.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParT_no_mask" ]]; then
+    modelopts="networks/example_ParticleTransformer_no_mask.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParT_no_mask_aug" ]]; then
+    modelopts="networks/example_ParticleTransformer_no_mask_augmented.py --use-amp"
     batchopts="--batch-size 512 --start-lr 1e-3"
 elif [[ "$model" == "PN" ]]; then
     modelopts="networks/example_ParticleNet.py"
@@ -43,6 +58,7 @@ elif [[ "$model" == "PCNN" ]]; then
     batchopts="--batch-size 4096 --start-lr 2e-2"
 else
     echo "Invalid model $model!"
+    echo "Valid models: ParT, ParT_gated, ParT_gated_no_mask, ParT_addnodes, ParT_no_mask, ParT_no_mask_aug, PN, PFN, PCNN"
     exit 1
 fi
 
