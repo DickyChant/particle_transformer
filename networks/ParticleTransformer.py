@@ -159,6 +159,74 @@ def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
         return tensor
 
 
+class SequenceTrimmer(nn.Module):
+    """
+    Trims sequences to a maximum length and optionally shuffles particles during training.
+    This helps with computational efficiency and acts as a form of data augmentation.
+    """
+    def __init__(self, enabled=True):
+        super().__init__()
+        self.enabled = enabled
+        self._counter = 0
+    
+    def forward(self, x, v=None, mask=None, uu=None):
+        """
+        Args:
+            x: (N, C, P) - particle features
+            v: (N, 4, P) - Lorentz vectors [px, py, pz, energy] or None
+            mask: (N, 1, P) - particle mask (1 = real, 0 = padded) or None
+            uu: (N, C', P, P) - pair features or None
+        
+        Returns:
+            Trimmed versions of x, v, mask, uu
+        """
+        if not self.enabled:
+            return x, v, mask, uu
+        
+        with torch.no_grad():
+            if mask is None:
+                mask = torch.ones_like(x[:, :1])
+            mask = mask.bool()
+            
+            if self._counter < 5:
+                self._counter += 1
+            else:
+                if self.training:
+                    # Randomly determine max length (90-100% of actual length)
+                    q = min(1, random.uniform(0.9, 1.02))
+                    maxlen = torch.quantile(mask.type_as(x).sum(dim=-1), q).long()
+                    
+                    # Randomly shuffle particles (keeping real particles first)
+                    rand = torch.rand_like(mask.type_as(x))
+                    rand.masked_fill_(~mask, -1)
+                    perm = rand.argsort(dim=-1, descending=True)
+                    
+                    # Apply permutation
+                    mask = torch.gather(mask, -1, perm)
+                    x = torch.gather(x, -1, perm.expand_as(x))
+                    if v is not None:
+                        v = torch.gather(v, -1, perm.expand_as(v))
+                    if uu is not None:
+                        # Permute pair features accordingly
+                        uu = torch.gather(uu, -1, perm.unsqueeze(1).expand_as(uu))
+                        uu = torch.gather(uu, -2, perm.unsqueeze(2).expand_as(uu))
+                else:
+                    maxlen = mask.sum(dim=-1).max()
+                
+                maxlen = max(maxlen, 1)
+                
+                # Trim to maxlen
+                if maxlen < mask.size(-1):
+                    mask = mask[:, :, :maxlen]
+                    x = x[:, :, :maxlen]
+                    if v is not None:
+                        v = v[:, :, :maxlen]
+                    if uu is not None:
+                        uu = uu[:, :, :maxlen, :maxlen]
+        
+        return x, v, mask, uu
+
+
 class Embed(nn.Module):
     def __init__(self, input_dim, dims, normalize_input=True, activation='gelu'):
         super().__init__()
@@ -1102,6 +1170,7 @@ class ParticleTransformerGated_v1(nn.Module):
                  cls_block_params={'dropout': 0, 'attn_dropout': 0, 'activation_dropout': 0},
                  fc_params=[],
                  activation='gelu',
+                 gate_activation='silu',
                  # misc
                  trim=True,
                  for_inference=False,
