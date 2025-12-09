@@ -61,7 +61,7 @@ elif [[ "$model" == "PCNN" ]]; then
     batchopts="--batch-size 4096 --start-lr 2e-2"
 else
     echo "Invalid model $model!"
-    echo "Valid models: ParT, ParT_gated, ParT_gated_no_mask, ParT_addnodes, ParT_no_mask, ParT_no_mask_aug, PN, PFN, PCNN"
+    echo "Valid models: ParT, ParT_gated, ParT_gated_v1, ParT_gated_no_mask, ParT_addnodes, ParT_no_mask, ParT_no_mask_aug, PN, PFN, PCNN"
     exit 1
 fi
 
