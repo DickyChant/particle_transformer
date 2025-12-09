@@ -35,6 +35,9 @@ if [[ "$model" == "ParT" ]]; then
 elif [[ "$model" == "ParT_gated" ]]; then
     modelopts="networks/example_ParticleTransformer_gated.py --use-amp"
     batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParT_gated_v1" ]]; then
+    modelopts="networks/example_ParticleTransformer_gated_v1.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
 elif [[ "$model" == "ParT_gated_no_mask" ]]; then
     modelopts="networks/example_ParticleTransformer_gated_no_mask.py --use-amp"
     batchopts="--batch-size 512 --start-lr 1e-3"

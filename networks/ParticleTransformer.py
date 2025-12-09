@@ -546,6 +546,270 @@ class AugmentedBlock(nn.Module):
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'null_token', } if self.use_augmented_attention else set()
+    
+class GatedMultiheadAttention(nn.Module):
+    """
+    Multi-head self-attention with Qwen-style gating:
+      q_proj: [embed_dim] -> [2 * embed_dim] = [q || gate]
+      gate applied elementwise on the attention output per head.
+
+    API matches nn.MultiheadAttention on shapes:
+      query, key, value: (tgt_len/src_len, batch, embed_dim)
+    """
+
+    def __init__(self, embed_dim, num_heads, attn_dropout=0.0, bias=True):
+        super().__init__()
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.attn_dropout = attn_dropout
+
+        # q_proj outputs [query, gate]
+        self.q_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def forward(
+        self,
+        query,                  # (tgt_len, bsz, embed_dim)
+        key,                    # (src_len, bsz, embed_dim)
+        value,                  # (src_len, bsz, embed_dim)
+        key_padding_mask=None,  # (bsz, src_len), 1/True = pad
+        attn_mask=None,         # (tgt, src) or (bsz, tgt, src) or (bsz*num_heads, tgt, src)
+        need_weights: bool = False,
+    ):
+        tgt_len, bsz, _ = query.size()
+        src_len, bsz_k, _ = key.size()
+        assert bsz == bsz_k
+
+        # to batch-first
+        q = query.transpose(0, 1)  # (bsz, tgt_len, embed_dim)
+        k = key.transpose(0, 1)    # (bsz, src_len, embed_dim)
+        v = value.transpose(0, 1)  # (bsz, src_len, embed_dim)
+
+        # projections
+        q_proj = self.q_proj(q)            # (bsz, tgt_len, 2*embed_dim)
+        k_proj = self.k_proj(k)            # (bsz, src_len, embed_dim)
+        v_proj = self.v_proj(v)            # (bsz, src_len, embed_dim)
+
+        # split into query + gate: (bsz, tgt_len, num_heads, 2*head_dim)
+        q_proj = q_proj.view(bsz, tgt_len, self.num_heads, 2 * self.head_dim)
+        q_states, gate_scores = torch.split(
+            q_proj,
+            [self.head_dim, self.head_dim],
+            dim=-1,
+        )  # each: (bsz, tgt_len, num_heads, head_dim)
+
+        k_states = k_proj.view(bsz, src_len, self.num_heads, self.head_dim)
+        v_states = v_proj.view(bsz, src_len, self.num_heads, self.head_dim)
+
+        # (bsz, num_heads, len, head_dim)
+        q_states = q_states.permute(0, 2, 1, 3)  # (bsz, H, tgt, D)
+        k_states = k_states.permute(0, 2, 1, 3)  # (bsz, H, src, D)
+        v_states = v_states.permute(0, 2, 1, 3)  # (bsz, H, src, D)
+        
+
+
+        # scaled dot-product attention
+        attn_weights = torch.matmul(
+            q_states, k_states.transpose(-2, -1)
+        ) / math.sqrt(self.head_dim)  # (bsz, H, tgt, src)
+
+        # --- attn_mask handling ---
+        #   - (tgt, src)
+        #   - (bsz, tgt, src)
+        #   - (bsz * num_heads, tgt, src)  like your pair_embed
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                t_m, s_m = attn_mask.shape
+                if t_m != tgt_len or s_m != src_len:
+                    raise ValueError(
+                        f"2D attn_mask must be (tgt_len, src_len), got {attn_mask.shape}"
+                    )
+                mask = attn_mask
+                if mask.dtype == torch.bool:
+                    attn_weights = attn_weights.masked_fill(
+                        mask[None, None, :, :], float("-inf")
+                    )
+                else:
+                    attn_weights = attn_weights + mask[None, None, :, :]
+
+            elif attn_mask.dim() == 3:
+                b_m, t_m, s_m = attn_mask.shape
+                if t_m != tgt_len or s_m != src_len:
+                    raise ValueError(
+                        f"3D attn_mask last two dims must be (tgt_len, src_len), "
+                        f"got {attn_mask.shape}, expected (*, {tgt_len}, {src_len})"
+                    )
+
+                if b_m == bsz:
+                    # (bsz, tgt, src): broadcast over heads
+                    mask = attn_mask
+                    if mask.dtype == torch.bool:
+                        attn_weights = attn_weights.masked_fill(
+                            mask[:, None, :, :], float("-inf")
+                        )
+                    else:
+                        attn_weights = attn_weights + mask[:, None, :, :]
+
+                elif b_m == bsz * self.num_heads:
+                    # (bsz * H, tgt, src): per-(batch, head) mask (your case)
+                    mask = attn_mask.view(bsz, self.num_heads, tgt_len, src_len)
+                    if mask.dtype == torch.bool:
+                        attn_weights = attn_weights.masked_fill(mask, float("-inf"))
+                    else:
+                        attn_weights = attn_weights + mask
+                else:
+                    raise ValueError(
+                        f"3D attn_mask first dim must be bsz ({bsz}) or "
+                        f"bsz * num_heads ({bsz * self.num_heads}), got {b_m}"
+                    )
+            else:
+                raise ValueError(
+                    f"attn_mask must be 2D or 3D, got shape {attn_mask.shape}"
+                )
+
+        # key_padding_mask: (bsz, src_len)
+        if key_padding_mask is not None:
+            if key_padding_mask.dtype != torch.bool:
+                key_padding_mask = key_padding_mask.bool()
+            attn_weights = attn_weights.masked_fill(
+                key_padding_mask[:, None, None, :],
+                float("-inf"),
+            )
+
+        attn_probs = F.softmax(attn_weights, dim=-1)
+        attn_probs = F.dropout(attn_probs, p=self.attn_dropout, training=self.training)
+
+        attn_output = torch.matmul(attn_probs, v_states)  # (bsz, H, tgt, D)
+
+        # Qwen-style elementwise gate from q_proj
+        gate = torch.sigmoid(
+            gate_scores.permute(0, 2, 1, 3)
+        )  # (bsz, H, tgt, D)
+        attn_output = attn_output * gate
+
+        # merge heads -> (bsz, tgt, embed_dim)
+        attn_output = (
+            attn_output.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(bsz, tgt_len, self.embed_dim)
+        )
+        attn_output = self.out_proj(attn_output)  # (bsz, tgt, embed_dim)
+
+        # back to (tgt_len, bsz, embed_dim)
+        attn_output = attn_output.transpose(0, 1)  # (tgt_len, bsz, embed_dim)
+        #print(f'attn_output {attn_output.shape}')
+        
+
+        return attn_output
+
+class GatedBlock_v1(nn.Module):
+    def __init__(self, embed_dim=128, num_heads=8, ffn_ratio=4,
+                 dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
+                 add_bias_kv=False,  # kept for API compat, not used
+                 activation='gelu',
+                 scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True,
+                 gate_activation='silu'):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.ffn_dim = embed_dim * ffn_ratio
+
+        self.pre_attn_norm = nn.LayerNorm(embed_dim)
+        # swapped to gated attention
+        self.attn = GatedMultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            attn_dropout=attn_dropout,
+        )
+        self.post_attn_norm = nn.LayerNorm(embed_dim) if scale_attn else None
+        self.dropout = nn.Dropout(dropout)
+
+        self.pre_fc_norm = nn.LayerNorm(embed_dim)
+        self.fc1 = nn.Linear(embed_dim, self.ffn_dim)
+        self.act = nn.GELU() if activation == 'gelu' else nn.ReLU()
+        self.act_dropout = nn.Dropout(activation_dropout)
+        self.post_fc_norm = nn.LayerNorm(self.ffn_dim) if scale_fc else None
+        self.fc2 = nn.Linear(self.ffn_dim, embed_dim)
+
+        # Gated FFN output gate
+        if gate_activation == 'silu':
+            self.attn_gate_act = nn.SiLU()
+        else:
+            self.attn_gate_act = nn.Sigmoid()
+        self.attn_gate = nn.Linear(embed_dim, embed_dim)
+            
+        if gate_activation == 'silu':
+            self.ffn_gate_act = nn.SiLU()
+        else:
+            self.ffn_gate_act = nn.Sigmoid()
+        self.ffn_gate = nn.Linear(embed_dim, embed_dim)
+
+        self.c_attn = nn.Parameter(torch.ones(num_heads), requires_grad=True) if scale_heads else None
+        self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
+
+    def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None):
+        """
+        x:      (seq_len, batch, embed_dim)
+        x_cls:  (1, batch, embed_dim) or None
+        padding_mask: (batch, seq_len), 1/True = pad
+        attn_mask: (seq_len, seq_len)
+        """
+
+        if x_cls is not None:
+            with torch.no_grad():
+                # prepend one element for x_cls: -> (batch, 1+seq_len)
+                padding_mask = torch.cat(
+                    (torch.zeros_like(padding_mask[:, :1]), padding_mask),
+                    dim=1,
+                )
+            # class attention: https://arxiv.org/pdf/2103.17239.pdf
+            residual = x_cls
+            u = torch.cat((x_cls, x), dim=0)  # (seq_len+1, batch, embed_dim)
+            u = self.pre_attn_norm(u)
+            attn_out = self.attn(x_cls, u, u, key_padding_mask=padding_mask)  # (1, batch, embed_dim)
+        else:
+            residual = x
+            x = self.pre_attn_norm(x)
+            attn_out = self.attn(
+                x, x, x,
+                key_padding_mask=padding_mask,
+                attn_mask=attn_mask,
+            )  # (seq_len, batch, embed_dim)
+        
+        if self.c_attn is not None:
+            tgt_len, bsz = attn_out.size(0), attn_out.size(1)
+            attn_out = attn_out.view(tgt_len, bsz, self.num_heads, self.head_dim)
+            attn_out = torch.einsum('tbhd,h->tbdh', attn_out, self.c_attn)
+            attn_out = attn_out.reshape(tgt_len, bsz, self.embed_dim)
+        if self.post_attn_norm is not None:
+            attn_out = self.post_attn_norm(attn_out)
+        
+        attn_out = self.dropout(attn_out)
+        x = attn_out + residual
+
+        residual = x
+        x = self.pre_fc_norm(x)
+        ffn_out = self.act(self.fc1(x))
+        ffn_out = self.act_dropout(ffn_out)
+        if self.post_fc_norm is not None:
+            ffn_out = self.post_fc_norm(ffn_out)
+        ffn_out = self.fc2(ffn_out)
+        
+        # Apply gated FFN: gate modulates the FFN output
+        ffn_gate = self.ffn_gate_act(self.ffn_gate(ffn_out))
+        ffn_out = ffn_out * ffn_gate
+        ffn_out = self.dropout(ffn_out)
+        if self.w_resid is not None:
+            residual = torch.mul(self.w_resid, residual)
+        x = ffn_out + residual
+
+        return x
 
 
 class ParticleTransformer(nn.Module):
@@ -816,6 +1080,128 @@ class ParticleTransformerGated(nn.Module):
             output = self.fc(x_cls)
             if self.for_inference:
                 output = torch.softmax(output, dim=1)
+            return output
+        
+        
+class ParticleTransformerGated_v1(nn.Module):
+
+    def __init__(self,
+                 input_dim,
+                 num_classes=None,
+                 # network configurations
+                 pair_input_dim=4,
+                 pair_extra_dim=0,
+                 #remove_self_pair=False,
+                 #use_pre_activation_pair=True,
+                 embed_dims=[128, 512, 128],
+                 pair_embed_dims=[64, 64, 64],
+                 num_heads=8,
+                 num_layers=8,
+                 num_cls_layers=2,
+                 block_params=None,
+                 cls_block_params={'dropout': 0, 'attn_dropout': 0, 'activation_dropout': 0},
+                 fc_params=[],
+                 activation='gelu',
+                 # misc
+                 trim=True,
+                 for_inference=False,
+                 use_amp=False,
+                 **kwargs) -> None:
+        super().__init__(**kwargs)
+        
+        print('version 1')
+        print('version 1')
+        print('#########')
+
+        self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
+        self.for_inference = for_inference
+        self.use_amp = use_amp
+
+        embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
+        default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
+                           dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
+                           add_bias_kv=False, activation=activation,
+                           scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True)
+
+        cfg_block = copy.deepcopy(default_cfg)
+        if block_params is not None:
+            cfg_block.update(block_params)
+        _logger.info('cfg_block: %s' % str(cfg_block))
+
+        cfg_cls_block = copy.deepcopy(default_cfg)
+        if cls_block_params is not None:
+            cfg_cls_block.update(cls_block_params)
+        _logger.info('cfg_cls_block: %s' % str(cfg_cls_block))
+
+        self.pair_extra_dim = pair_extra_dim
+        self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
+        #remove_self_pair=remove_self_pair, use_pre_activation_pair=use_pre_activation_pair,
+        self.pair_embed = PairEmbed(
+            pair_input_dim, pair_embed_dims + [cfg_block['num_heads']],
+            for_onnx=for_inference) if pair_embed_dims is not None and pair_input_dim > 0 else None
+        self.blocks = nn.ModuleList([GatedBlock_v1(**cfg_block) for _ in range(num_layers)])
+        self.cls_blocks = nn.ModuleList([GatedBlock_v1(**cfg_cls_block) for _ in range(num_cls_layers)])
+        self.norm = nn.LayerNorm(embed_dim)
+
+        if fc_params is not None:
+            fcs = []
+            in_dim = embed_dim
+            for out_dim, drop_rate in fc_params:
+                fcs.append(nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Dropout(drop_rate)))
+                in_dim = out_dim
+            fcs.append(nn.Linear(in_dim, num_classes))
+            self.fc = nn.Sequential(*fcs)
+        else:
+            self.fc = None
+
+        # init
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim), requires_grad=True)
+        trunc_normal_(self.cls_token, std=.02)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'cls_token', }
+
+    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None):
+        # x: (N, C, P)
+        # v: (N, 4, P) [px,py,pz,energy]
+        # mask: (N, 1, P) -- real particle = 1, padded = 0
+        # for pytorch: uu (N, C', num_pairs), uu_idx (N, 2, num_pairs)
+        # for onnx: uu (N, C', P, P), uu_idx=None
+
+        with torch.no_grad():
+            if not self.for_inference:
+                if uu_idx is not None:
+                    uu = build_sparse_tensor(uu, uu_idx, x.size(-1))
+            x, v, mask, uu = self.trimmer(x, v, mask, uu)
+            padding_mask = ~mask.squeeze(1)  # (N, P)
+
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            # input embedding
+            x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
+            attn_mask = None
+            if (v is not None or uu is not None) and self.pair_embed is not None:
+                attn_mask = self.pair_embed(v, uu).view(-1, v.size(-1), v.size(-1))  # (N*num_heads, P, P)
+
+            # transform
+            #print(attn_mask.shape)
+            for block in self.blocks:
+                x = block(x, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
+
+            # extract class token
+            cls_tokens = self.cls_token.expand(1, x.size(1), -1)  # (1, N, C)
+            for block in self.cls_blocks:
+                cls_tokens = block(x, x_cls=cls_tokens, padding_mask=padding_mask)
+
+            x_cls = self.norm(cls_tokens).squeeze(0)
+
+            # fc
+            if self.fc is None:
+                return x_cls
+            output = self.fc(x_cls)
+            if self.for_inference:
+                output = torch.softmax(output, dim=1)
+            # print('output:\n', output)
             return output
 
 
