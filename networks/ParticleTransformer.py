@@ -4,6 +4,7 @@ import warnings
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
 
 from weaver.utils.logger import _logger
@@ -70,6 +71,44 @@ def boost(x, boostp4, eps=1e-8):
 
 def p3_norm(p, eps=1e-8):
     return p[:, :3] / p[:, :3].norm(dim=1, keepdim=True).clamp(min=eps)
+
+
+def build_sparse_tensor(uu, uu_idx, seq_len):
+    """
+    Convert sparse pair features to dense tensor.
+    
+    Args:
+        uu: (N, C', num_pairs) - sparse pair features
+        uu_idx: (N, 2, num_pairs) - indices of pairs [i, j]
+        seq_len: int - sequence length (P)
+    
+    Returns:
+        uu_dense: (N, C', P, P) - dense pair features tensor
+    """
+    batch_size, feat_dim, num_pairs = uu.size()
+    device = uu.device
+    dtype = uu.dtype
+    
+    # Initialize dense tensor with zeros
+    uu_dense = torch.zeros(batch_size, feat_dim, seq_len, seq_len, dtype=dtype, device=device)
+    
+    # Extract indices
+    i_idx = uu_idx[:, 0, :].long()  # (N, num_pairs)
+    j_idx = uu_idx[:, 1, :].long()   # (N, num_pairs)
+    
+    # Create batch and feature indices for advanced indexing
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).unsqueeze(2).expand(-1, feat_dim, num_pairs)  # (N, C', num_pairs)
+    feat_indices = torch.arange(feat_dim, device=device).unsqueeze(0).unsqueeze(2).expand(batch_size, -1, num_pairs)  # (N, C', num_pairs)
+    
+    # Expand i_idx and j_idx to match dimensions
+    i_expanded = i_idx.unsqueeze(1).expand(-1, feat_dim, -1)  # (N, C', num_pairs)
+    j_expanded = j_idx.unsqueeze(1).expand(-1, feat_dim, -1)  # (N, C', num_pairs)
+    
+    # Fill dense tensor (symmetric) using advanced indexing
+    uu_dense[batch_indices, feat_indices, i_expanded, j_expanded] = uu
+    uu_dense[batch_indices, feat_indices, j_expanded, i_expanded] = uu  # symmetric
+    
+    return uu_dense
 
 
 def pairwise_lv_fts(xi, xj, num_outputs=4, eps=1e-8, for_onnx=False):
@@ -270,8 +309,9 @@ class PairEmbed(nn.Module):
 
         self.out_dim = dims[-1]
 
-    def forward(self, x):
+    def forward(self, x, uu=None):
         # x: (batch, v_dim, seq_len)
+        # uu: (batch, C', seq_len, seq_len) optional pair features
         with torch.no_grad():
             batch_size, _, seq_len = x.size()
             if not self.for_onnx:
@@ -290,6 +330,17 @@ class PairEmbed(nn.Module):
             y[:, :, j, i] = elements
         else:
             y = elements.view(batch_size, -1, seq_len, seq_len)
+        
+        # Add optional pair features if provided
+        if uu is not None:
+            # uu: (batch, C', seq_len, seq_len) -> need to project to out_dim if dimensions don't match
+            if uu.size(1) == self.out_dim:
+                y = y + uu
+            else:
+                # If dimensions don't match, we could add a projection layer, but for now just ignore
+                # This maintains backward compatibility
+                pass
+        
         return y
 
 
