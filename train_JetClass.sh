@@ -74,8 +74,8 @@ if ! [[ "${FEATURE_TYPE}" =~ ^(full|kin|kinpid)$ ]]; then
     exit 1
 fi
 
-# currently only Pythia
-SAMPLE_TYPE=Pythia
+# Use SAMPLE_TYPE from environment if set, otherwise default to Pythia
+SAMPLE_TYPE=${SAMPLE_TYPE:-Pythia}
 
 weaver \
     --data-train \
