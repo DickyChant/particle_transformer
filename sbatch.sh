@@ -26,12 +26,13 @@ OPTIMIZER="${4:-ranger}"
 
 # Validate model
 case "$MODEL" in
-    ParT|ParT_gated|ParT_gated_v1|ParT_gated_no_mask|ParT_addnodes|ParT_no_mask|ParT_no_mask_aug|PN|PFN|PCNN)
+    ParT|ParT_gated|ParT_gated_v1|ParT_gated_no_mask|ParT_addnodes|ParT_no_mask|ParT_no_mask_aug|ParT_peft|PN|PFN|PCNN)
         echo "Model: $MODEL"
         ;;
     *)
         echo "Error: Invalid model '$MODEL'"
         echo "Usage: $0 [model] [full|kin|kinpid] [Pythia|Herwig] [ranger|muon] [additional_args...]"
+        echo "Models: ParT, ParT_gated, ParT_gated_v1, ParT_gated_no_mask, ParT_addnodes, ParT_no_mask, ParT_no_mask_aug, ParT_peft, PN, PFN, PCNN"
         exit 1
         ;;
 esac
@@ -246,6 +247,12 @@ elif [[ "$model" == "PFN" ]]; then
 elif [[ "$model" == "PCNN" ]]; then
     modelopts="networks/example_PCNN.py"
     batchopts="--batch-size 4096 --start-lr 2e-2"
+elif [[ "$model" == "ParT_peft" ]]; then
+    # PEFT/LoRA fine-tuning - requires pretrained weights
+    modelopts="networks/example_ParticleTransformer_peft.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-4"
+    # Load pretrained weights and set LoRA parameters
+    PEFT_OPTS="--load-model-weights models/ParT_full.pt --network-option lora_r 8 --network-option lora_alpha 16 --network-option lora_dropout 0.1"
 else
     echo "Invalid model $model!"
     echo "Valid models: ParT, ParT_gated, ParT_gated_v1, ParT_gated_no_mask, ParT_addnodes, ParT_no_mask, ParT_no_mask_aug, PN, PFN, PCNN"
@@ -289,6 +296,7 @@ $CMD \
     --samples-per-epoch ${samples_per_epoch} --samples-per-epoch-val ${samples_per_epoch_val} --num-epochs $epochs --gpus 0 \
     --optimizer $OPTIMIZER --log "${LOG_DIR}/JetClass_${SAMPLE_TYPE}_${FEATURE_TYPE}_${model}_${OPTIMIZER}_{auto}${suffix}.log" --predict-output pred.root \
     --tensorboard "${TENSORBOARD_DIR}/JetClass_${SAMPLE_TYPE}_${FEATURE_TYPE}_${model}_${OPTIMIZER}${suffix}" \
+    ${PEFT_OPTS:-} \
     "${@:5}"
 
 TRAIN_EXIT_CODE=$?
