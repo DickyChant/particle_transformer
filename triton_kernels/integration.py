@@ -234,31 +234,31 @@ def patch_particle_transformer(model: nn.Module, use_triton: bool = True) -> nn.
     Returns:
         The patched model
     
+    Note:
+        Due to the deep integration of pairwise features in the ParT model,
+        full automatic patching is not supported. This function serves as a
+        placeholder and returns the model unchanged.
+        
+        For optimal performance, use the kernels directly:
+        - Use `TritonPairEmbed` as a drop-in replacement for `PairEmbed`
+        - Use `fused_attention_bias` in custom attention implementations
+    
     Example:
         >>> from weaver.nn.model.ParticleTransformer import ParticleTransformer
         >>> model = ParticleTransformer(input_dim=18, num_classes=10)
-        >>> model = patch_particle_transformer(model)
+        >>> # For full optimization, manually replace pair_embed:
+        >>> # model.pair_embed = TritonPairEmbed(...)
     """
     if not use_triton or not TRITON_AVAILABLE:
         return model
     
-    # Store original forward for wrapping
-    original_forward = model.forward
-    
-    def patched_forward(x, v=None, mask=None, uu=None, uu_idx=None):
-        # Use Triton kernel for pairwise features if available
-        if v is not None and hasattr(model, 'pair_embed') and model.pair_embed is not None:
-            with torch.no_grad():
-                batch, _, seq_len = v.shape
-                if v.is_cuda:
-                    # Compute pairwise features with Triton
-                    pair_fts = pairwise_lv_fts_triton(v, num_outputs=4)
-                    # This replaces the standard pairwise computation
-        
-        return original_forward(x, v, mask, uu, uu_idx)
-    
-    # Note: Full patching would require deeper integration
-    # For now, we provide the kernels for manual integration
+    # Note: Full automatic patching would require deeper integration with
+    # the weaver-core library. The Triton kernels are provided for manual
+    # integration in custom model implementations.
+    # 
+    # For maximum benefit, users should:
+    # 1. Replace PairEmbed with TritonPairEmbed
+    # 2. Use fused_attention_bias in attention blocks
     
     return model
 

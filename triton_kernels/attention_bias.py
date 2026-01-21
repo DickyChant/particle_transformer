@@ -212,7 +212,7 @@ class FusedAttentionBiasFunction(torch.autograd.Function):
         _fused_attention_bias_fwd_kernel[grid](
             q_flat, k_flat, v_flat, bias_flat, out_flat,
             seq_len, head_dim,
-            # Q strides
+            # Q strides - after flattening (batch*heads, seq, dim), batch and head strides are same
             q_flat.stride(0), q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
             # K strides
             k_flat.stride(0), k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),

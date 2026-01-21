@@ -49,7 +49,7 @@ def _pairwise_lv_fts_kernel(
     
     For each pair (i, j), computes:
     - pt_i, pt_j: transverse momentum
-    - rap_i, rap_j: rapidity  
+    - rap_i, rap_j: rapidity
     - phi_i, phi_j: azimuthal angle
     - deltaR: angular distance
     - kt: min(pt_i, pt_j) * deltaR

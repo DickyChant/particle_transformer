@@ -10,10 +10,10 @@ The Particle Transformer uses pairwise particle interaction features incorporate
 
 1. **Pairwise Lorentz Features** (`pairwise_features.py`)
    - Computes physics-motivated features for each particle pair:
-     - `ln(kt)`: log of the kT variable (momentum perpendicular to jet axis)
-     - `ln(z)`: log of the momentum fraction
+     - `ln(kt)`: log of the kT variable (`min(pt_i, pt_j) * ΔR`)
+     - `ln(z)`: log of the momentum fraction (`min(pt_i, pt_j) / (pt_i + pt_j)`)
      - `ln(ΔR)`: log of the angular distance in η-φ space
-     - `ln(m²)`: log of the invariant mass squared
+     - `ln(m²)`: log of the invariant mass squared of the pair
 
 2. **Fused Attention with Bias** (`attention_bias.py`)
    - Combines QK^T computation, bias addition, softmax, and output projection
