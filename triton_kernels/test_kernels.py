@@ -248,5 +248,99 @@ class TestBenchmark:
                 print(f"  Speedup: {metrics['speedup']:.2f}x")
 
 
+class TestCuDNNAttention:
+    """Tests for cuDNN Frontend attention integration."""
+    
+    def test_cudnn_availability_check(self):
+        """Test cuDNN version checking function."""
+        from triton_kernels.cudnn_attention import check_cudnn_version, CUDNN_FRONTEND_AVAILABLE
+        
+        # Should return a boolean
+        result = check_cudnn_version()
+        assert isinstance(result, bool)
+        
+        # If cudnn-frontend is not installed, should return False
+        if not CUDNN_FRONTEND_AVAILABLE:
+            assert result is False
+    
+    def test_cudnn_scaled_dot_product_attention_fallback(self):
+        """Test that cuDNN attention falls back to PyTorch when unavailable."""
+        from triton_kernels.cudnn_attention import CuDNNScaledDotProductAttention
+        
+        batch, num_heads, seq_len, head_dim = 2, 4, 16, 32
+        
+        attn = CuDNNScaledDotProductAttention(head_dim=head_dim).cuda()
+        
+        q = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        k = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        v = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        bias = torch.randn(batch, num_heads, seq_len, seq_len, device='cuda')
+        
+        # Should work even without cuDNN (falls back to PyTorch)
+        output = attn(q, k, v, bias)
+        
+        assert output.shape == q.shape
+        assert torch.isfinite(output).all()
+    
+    def test_cudnn_attention_correctness(self):
+        """Test cuDNN attention produces correct results (vs PyTorch reference)."""
+        from triton_kernels.cudnn_attention import CuDNNScaledDotProductAttention
+        
+        batch, num_heads, seq_len, head_dim = 2, 4, 16, 32
+        torch.manual_seed(42)
+        
+        attn = CuDNNScaledDotProductAttention(head_dim=head_dim).cuda()
+        
+        q = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        k = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        v = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        bias = torch.randn(batch, num_heads, seq_len, seq_len, device='cuda')
+        
+        # cuDNN attention (will use PyTorch fallback if cuDNN unavailable)
+        cudnn_out = attn(q, k, v, bias)
+        
+        # PyTorch reference
+        scale = 1.0 / (head_dim ** 0.5)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale + bias
+        pytorch_out = torch.matmul(torch.softmax(scores, dim=-1), v)
+        
+        torch.testing.assert_close(cudnn_out, pytorch_out, rtol=1e-3, atol=1e-3)
+    
+    def test_cudnn_multihead_attention_module(self):
+        """Test CuDNNMultiheadAttentionWithBias module."""
+        from triton_kernels.cudnn_attention import CuDNNMultiheadAttentionWithBias
+        
+        embed_dim, num_heads = 256, 8
+        seq_len, batch = 32, 4
+        
+        attn = CuDNNMultiheadAttentionWithBias(embed_dim, num_heads).cuda()
+        
+        query = torch.randn(seq_len, batch, embed_dim, device='cuda')
+        key = torch.randn(seq_len, batch, embed_dim, device='cuda')
+        value = torch.randn(seq_len, batch, embed_dim, device='cuda')
+        attn_bias = torch.randn(batch, num_heads, seq_len, seq_len, device='cuda')
+        
+        output, _ = attn(query, key, value, attn_bias)
+        
+        assert output.shape == (seq_len, batch, embed_dim)
+        assert torch.isfinite(output).all()
+    
+    def test_cudnn_attention_with_bias_function(self):
+        """Test cudnn_attention_with_bias functional interface."""
+        from triton_kernels.cudnn_attention import cudnn_attention_with_bias
+        
+        batch, num_heads, seq_len, head_dim = 2, 4, 16, 32
+        
+        q = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        k = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        v = torch.randn(batch, num_heads, seq_len, head_dim, device='cuda')
+        bias = torch.randn(batch, num_heads, seq_len, seq_len, device='cuda')
+        
+        output = cudnn_attention_with_bias(q, k, v, bias)
+        
+        assert output.shape == q.shape
+        assert torch.isfinite(output).all()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
