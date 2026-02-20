@@ -30,8 +30,8 @@ MODEL_CONFIGS = {
     'tiny':   dict(embed_dims=[64, 256, 64],     pair_embed_dims=[32, 32, 32],     num_heads=4,  num_layers=4,  num_cls_layers=1),
     'small':  dict(embed_dims=[96, 384, 96],     pair_embed_dims=[48, 48, 48],     num_heads=8,  num_layers=6,  num_cls_layers=2),
     'base':   dict(embed_dims=[128, 512, 128],   pair_embed_dims=[64, 64, 64],     num_heads=8,  num_layers=8,  num_cls_layers=2),
-    'large':  dict(embed_dims=[192, 768, 192],   pair_embed_dims=[96, 96, 96],     num_heads=8,  num_layers=10, num_cls_layers=2),
-    'xlarge': dict(embed_dims=[256, 1024, 256],  pair_embed_dims=[128, 128, 128],  num_heads=16, num_layers=12, num_cls_layers=2),
+    'large':  dict(embed_dims=[256, 1024, 256],  pair_embed_dims=[128, 128, 128],  num_heads=16, num_layers=12, num_cls_layers=2),
+    'xlarge': dict(embed_dims=[384, 1536, 384],  pair_embed_dims=[192, 192, 192],  num_heads=16, num_layers=16, num_cls_layers=3),
 }
 
 # Data budget -> total training samples
