@@ -48,13 +48,7 @@ case "$DATA_BUDGET" in
 esac
 
 # ---- Environment Setup ----
-if [ -n "$SLURM_SUBMIT_DIR" ]; then
-    SCRIPT_DIR="$SLURM_SUBMIT_DIR"
-else
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-fi
-# cd to the repo root (parent of scaling/)
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="/global/homes/s/sqian/jetclass_dir/particle_transformer"
 cd "$REPO_DIR"
 
 export DDP_NGPUS=4
