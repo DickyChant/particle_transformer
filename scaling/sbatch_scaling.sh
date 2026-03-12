@@ -10,42 +10,75 @@
 #SBATCH --module=cvmfs
 #SBATCH --open-mode=append
 #SBATCH --requeue
-#SBATCH --output=/pscratch/sd/s/sqian/part_training_output/scaling_study/slurm_logs/slurm-%j.out
-#SBATCH --error=/pscratch/sd/s/sqian/part_training_output/scaling_study/slurm_logs/slurm-%j.err
+#SBATCH --output=/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/slurm_logs/slurm-%j.out
+#SBATCH --error=/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/slurm_logs/slurm-%j.err
 
 # =============================================================================
-# Chinchilla Scaling Law Study - Single Run Script
-# Usage: sbatch sbatch_scaling.sh <model_size> <data_budget> [additional_args...]
-#   model_size:  nano, micro, tiny, small, base, large, xlarge
-#   data_budget: 5M, 10M, 25M, 50M, 100M, 250M, 500M
+# Chinchilla Scaling Law Study v2 - Single Run Script
+#
+# Usage:
+#   sbatch sbatch_scaling.sh <model_size> <data_budget> [options...]
+#
+# Required args:
+#   model_size:   nano, micro, tiny, small, base, large, xlarge
+#   data_budget:  5M, 10M, 25M, 50M, 100M, 250M, 500M
+#
+# Optional env vars (set before sbatch or export):
+#   SAMPLE_TYPE:  Pythia (default), Herwig, Mixed
+#   FEATURE_TYPE: full (default), kinpid, kin
+#   PAIR_FEATURES: 1 (default, with pairwise), 0 (without pairwise)
+#
+# Examples:
+#   sbatch sbatch_scaling.sh base 100M
+#   SAMPLE_TYPE=Mixed FEATURE_TYPE=kinpid sbatch sbatch_scaling.sh small 50M
+#   PAIR_FEATURES=0 sbatch sbatch_scaling.sh base 100M
 # =============================================================================
+
+set -euo pipefail
 
 MODEL_SIZE="${1:?Error: model_size required (nano/micro/tiny/small/base/large/xlarge)}"
 DATA_BUDGET="${2:?Error: data_budget required (5M/10M/25M/50M/100M/250M/500M)}"
 
-# Validate model size
+# ---- Defaults for optional env vars ----
+SAMPLE_TYPE="${SAMPLE_TYPE:-Pythia}"
+FEATURE_TYPE="${FEATURE_TYPE:-full}"
+PAIR_FEATURES="${PAIR_FEATURES:-1}"
+
+# ---- Validation ----
 case "$MODEL_SIZE" in
-    nano|micro|tiny|small|base|large|xlarge)
-        echo "Model size: $MODEL_SIZE"
-        ;;
-    *)
-        echo "Error: Invalid model size '$MODEL_SIZE'"
-        echo "Valid sizes: nano, micro, tiny, small, base, large, xlarge"
-        exit 1
-        ;;
+    nano|micro|tiny|small|base|large|xlarge) ;;
+    *) echo "Error: Invalid model size '$MODEL_SIZE'"; exit 1 ;;
 esac
 
-# Validate data budget
 case "$DATA_BUDGET" in
-    5M|10M|25M|50M|100M|250M|500M)
-        echo "Data budget: $DATA_BUDGET"
-        ;;
-    *)
-        echo "Error: Invalid data budget '$DATA_BUDGET'"
-        echo "Valid budgets: 5M, 10M, 25M, 50M, 100M, 250M, 500M"
-        exit 1
-        ;;
+    5M|10M|25M|50M|100M|250M|500M) ;;
+    *) echo "Error: Invalid data budget '$DATA_BUDGET'"; exit 1 ;;
 esac
+
+case "$SAMPLE_TYPE" in
+    Pythia|Herwig|Mixed) ;;
+    *) echo "Error: Invalid SAMPLE_TYPE '$SAMPLE_TYPE' (Pythia/Herwig/Mixed)"; exit 1 ;;
+esac
+
+case "$FEATURE_TYPE" in
+    full|kinpid|kin) ;;
+    *) echo "Error: Invalid FEATURE_TYPE '$FEATURE_TYPE' (full/kinpid/kin)"; exit 1 ;;
+esac
+
+case "$PAIR_FEATURES" in
+    0|1) ;;
+    *) echo "Error: Invalid PAIR_FEATURES '$PAIR_FEATURES' (0 or 1)"; exit 1 ;;
+esac
+
+# ---- Structured header (parseable by plot_scaling_laws.py) ----
+echo "===== SCALING_RUN_CONFIG ====="
+echo "model_size: $MODEL_SIZE"
+echo "data_budget: $DATA_BUDGET"
+echo "sample_type: $SAMPLE_TYPE"
+echo "feature_type: $FEATURE_TYPE"
+echo "pair_features: $PAIR_FEATURES"
+echo "slurm_job_id: ${SLURM_JOB_ID:-local}"
+echo "===== END_CONFIG ====="
 
 # ---- Environment Setup ----
 REPO_DIR="/global/homes/s/sqian/jetclass_dir/particle_transformer"
@@ -55,8 +88,13 @@ export DDP_NGPUS=4
 NGPUS=$DDP_NGPUS
 
 # ---- Output Directories ----
-export OUTPUT_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study"
+export OUTPUT_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2"
 mkdir -p "$OUTPUT_BASE/slurm_logs"
+
+# Build run name from all dimensions
+PAIR_TAG="pair"
+[[ "$PAIR_FEATURES" == "0" ]] && PAIR_TAG="nopair"
+RUN_NAME="${MODEL_SIZE}_${DATA_BUDGET}_${SAMPLE_TYPE}_${FEATURE_TYPE}_${PAIR_TAG}"
 
 # Unique timestamp (preserved across requeueing)
 TIMESTAMP_FILE="$OUTPUT_BASE/timestamps/TIMESTAMP_${SLURM_JOB_ID}"
@@ -70,7 +108,6 @@ else
     echo "New timestamp: $TIMESTAMP"
 fi
 
-RUN_NAME="${MODEL_SIZE}_${DATA_BUDGET}"
 export CHECKPOINT_DIR="$OUTPUT_BASE/checkpoints/${RUN_NAME}_${TIMESTAMP}"
 export LOG_DIR="$OUTPUT_BASE/logs"
 export TENSORBOARD_DIR="$OUTPUT_BASE/tensorboard"
@@ -81,9 +118,7 @@ echo "Run: $RUN_NAME"
 echo "Checkpoint: $CHECKPOINT_DIR"
 
 # ---- Check for existing checkpoints (resume support) ----
-CHECKPOINT_EXISTS=false
 if ls "$CHECKPOINT_DIR"/*.pt 1> /dev/null 2>&1; then
-    CHECKPOINT_EXISTS=true
     echo "Found existing checkpoints"
 fi
 
@@ -108,91 +143,94 @@ function requeue () {
 module load conda
 conda activate weaver
 
-# ---- Dataset ----
+# ---- Dataset paths ----
 DATADIR="/pscratch/sd/s/sqian/part_datasets/JetClass"
-SAMPLE_TYPE="Pythia"
-FEATURE_TYPE="full"
+JET_CLASSES="HToBB HToCC HToGG HToWW2Q1L HToWW4Q TTBar TTBarLep WToQQ ZToQQ ZJetsToNuNu"
+
+# Build --data-train arguments based on SAMPLE_TYPE
+DATA_TRAIN_ARGS=()
+DATA_VAL_ARGS=()
+DATA_TEST_ARGS=()
+
+add_sample_paths() {
+    local stype="$1"
+    for cls in $JET_CLASSES; do
+        DATA_TRAIN_ARGS+=("${cls}_${stype}:${DATADIR}/${stype}/train_100M/${cls}_*.root")
+    done
+    DATA_VAL_ARGS+=("${DATADIR}/${stype}/val_5M/*.root")
+    DATA_TEST_ARGS+=("${DATADIR}/${stype}/test_20M/*.root")
+}
+
+case "$SAMPLE_TYPE" in
+    Pythia)
+        add_sample_paths "Pythia"
+        UNIQUE_SAMPLES=100000000
+        ;;
+    Herwig)
+        add_sample_paths "Herwig"
+        UNIQUE_SAMPLES=100000000
+        ;;
+    Mixed)
+        # Both Pythia and Herwig -> 200M unique training samples
+        add_sample_paths "Pythia"
+        add_sample_paths "Herwig"
+        UNIQUE_SAMPLES=200000000
+        ;;
+esac
+
+echo "Unique training samples: $UNIQUE_SAMPLES"
 
 # ---- Model Configuration ----
-# Map model_size -> network config, batch size, learning rate
+network_config="scaling/model_configs/ParT_${MODEL_SIZE}.py"
+
 case "$MODEL_SIZE" in
-    nano)
-        network_config="scaling/model_configs/ParT_nano.py"
-        batch_size=512
-        start_lr=1e-3
-        ;;
-    micro)
-        network_config="scaling/model_configs/ParT_micro.py"
-        batch_size=512
-        start_lr=1e-3
-        ;;
-    tiny)
-        network_config="scaling/model_configs/ParT_tiny.py"
-        batch_size=512
-        start_lr=1e-3
-        ;;
-    small)
-        network_config="scaling/model_configs/ParT_small.py"
-        batch_size=512
-        start_lr=1e-3
-        ;;
-    base)
-        network_config="scaling/model_configs/ParT_base.py"
+    nano|micro|tiny|small|base)
         batch_size=512
         start_lr=1e-3
         ;;
     large)
-        network_config="scaling/model_configs/ParT_large.py"
         batch_size=256
         start_lr=5e-4
         ;;
     xlarge)
-        network_config="scaling/model_configs/ParT_xlarge.py"
         batch_size=128
         start_lr=5e-4
         ;;
 esac
 
+# Pairwise feature control via --network-option
+NETWORK_OPTS=()
+if [[ "$PAIR_FEATURES" == "0" ]]; then
+    NETWORK_OPTS+=(--network-option pair_input_dim 0 --network-option pair_embed_dims None)
+    echo "Pairwise features: DISABLED"
+else
+    echo "Pairwise features: ENABLED"
+fi
+
 # ---- Data Budget Configuration ----
-# Map data_budget -> samples_per_epoch (per GPU) and num_epochs
 # Total samples = samples_per_epoch * NGPUS * num_epochs
 case "$DATA_BUDGET" in
-    5M)
-        samples_per_epoch=320000
-        num_epochs=4
-        ;;
-    10M)
-        samples_per_epoch=640000
-        num_epochs=4
-        ;;
-    25M)
-        samples_per_epoch=1600000
-        num_epochs=4
-        ;;
-    50M)
-        samples_per_epoch=1600000
-        num_epochs=8
-        ;;
-    100M)
-        samples_per_epoch=1600000
-        num_epochs=16
-        ;;
-    250M)
-        samples_per_epoch=1600000
-        num_epochs=40
-        ;;
-    500M)
-        samples_per_epoch=2560000
-        num_epochs=50
-        ;;
+    5M)   samples_per_epoch=320000;   num_epochs=4  ;;
+    10M)  samples_per_epoch=640000;   num_epochs=4  ;;
+    25M)  samples_per_epoch=1600000;  num_epochs=4  ;;
+    50M)  samples_per_epoch=1600000;  num_epochs=8  ;;
+    100M) samples_per_epoch=1600000;  num_epochs=16 ;;
+    250M) samples_per_epoch=1600000;  num_epochs=40 ;;
+    500M) samples_per_epoch=2560000;  num_epochs=50 ;;
 esac
 
 samples_per_epoch_val=1280000
+TOTAL_SAMPLES=$(( samples_per_epoch * NGPUS * num_epochs ))
+DATA_REUSE="no"
+if (( TOTAL_SAMPLES > UNIQUE_SAMPLES )); then
+    DATA_REUSE="yes ($(echo "scale=1; $TOTAL_SAMPLES / $UNIQUE_SAMPLES" | bc)x)"
+fi
 
 echo "Network config: $network_config"
 echo "Batch size: $batch_size, LR: $start_lr"
 echo "Samples/epoch (per GPU): $samples_per_epoch, Epochs: $num_epochs"
-echo "Total training samples: $(( samples_per_epoch * NGPUS * num_epochs ))"
+echo "Total training samples: $TOTAL_SAMPLES"
+echo "Data reuse: $DATA_REUSE"
 
 # ---- DDP Command ----
 if ((NGPUS > 1)); then
@@ -215,31 +253,12 @@ echo "Restart count: $restarts"
 
 # ---- Launch Training ----
 $CMD \
-    --data-train \
-    "HToBB:${DATADIR}/${SAMPLE_TYPE}/train_100M/HToBB_*.root" \
-    "HToCC:${DATADIR}/${SAMPLE_TYPE}/train_100M/HToCC_*.root" \
-    "HToGG:${DATADIR}/${SAMPLE_TYPE}/train_100M/HToGG_*.root" \
-    "HToWW2Q1L:${DATADIR}/${SAMPLE_TYPE}/train_100M/HToWW2Q1L_*.root" \
-    "HToWW4Q:${DATADIR}/${SAMPLE_TYPE}/train_100M/HToWW4Q_*.root" \
-    "TTBar:${DATADIR}/${SAMPLE_TYPE}/train_100M/TTBar_*.root" \
-    "TTBarLep:${DATADIR}/${SAMPLE_TYPE}/train_100M/TTBarLep_*.root" \
-    "WToQQ:${DATADIR}/${SAMPLE_TYPE}/train_100M/WToQQ_*.root" \
-    "ZToQQ:${DATADIR}/${SAMPLE_TYPE}/train_100M/ZToQQ_*.root" \
-    "ZJetsToNuNu:${DATADIR}/${SAMPLE_TYPE}/train_100M/ZJetsToNuNu_*.root" \
-    --data-val "${DATADIR}/${SAMPLE_TYPE}/val_5M/*.root" \
-    --data-test \
-    "HToBB:${DATADIR}/${SAMPLE_TYPE}/test_20M/HToBB_*.root" \
-    "HToCC:${DATADIR}/${SAMPLE_TYPE}/test_20M/HToCC_*.root" \
-    "HToGG:${DATADIR}/${SAMPLE_TYPE}/test_20M/HToGG_*.root" \
-    "HToWW2Q1L:${DATADIR}/${SAMPLE_TYPE}/test_20M/HToWW2Q1L_*.root" \
-    "HToWW4Q:${DATADIR}/${SAMPLE_TYPE}/test_20M/HToWW4Q_*.root" \
-    "TTBar:${DATADIR}/${SAMPLE_TYPE}/test_20M/TTBar_*.root" \
-    "TTBarLep:${DATADIR}/${SAMPLE_TYPE}/test_20M/TTBarLep_*.root" \
-    "WToQQ:${DATADIR}/${SAMPLE_TYPE}/test_20M/WToQQ_*.root" \
-    "ZToQQ:${DATADIR}/${SAMPLE_TYPE}/test_20M/ZToQQ_*.root" \
-    "ZJetsToNuNu:${DATADIR}/${SAMPLE_TYPE}/test_20M/ZJetsToNuNu_*.root" \
+    --data-train "${DATA_TRAIN_ARGS[@]}" \
+    --data-val "${DATA_VAL_ARGS[@]}" \
+    --data-test "${DATA_TEST_ARGS[@]}" \
     --data-config "data/JetClass/JetClass_${FEATURE_TYPE}.yaml" \
     --network-config "$network_config" \
+    "${NETWORK_OPTS[@]}" \
     --model-prefix "$MODEL_PREFIX" \
     --batch-size $batch_size --start-lr $start_lr \
     --num-workers 2 --fetch-step 0.01 \
@@ -255,6 +274,33 @@ $CMD \
     "${@:3}"
 
 TRAIN_EXIT_CODE=$?
+
+# ---- Post-training summary (logged to SLURM stdout for easy parsing) ----
+echo ""
+echo "===== SCALING_RUN_RESULT ====="
+echo "run_name: $RUN_NAME"
+echo "exit_code: $TRAIN_EXIT_CODE"
+
+# Extract final losses from the rank-0 weaver log
+WEAVER_LOG=$(ls -t "${LOG_DIR}/${RUN_NAME}_"*.log.000 2>/dev/null | head -1)
+if [ -n "$WEAVER_LOG" ] && [ -f "$WEAVER_LOG" ]; then
+    # Get the best (lowest) training loss across all epochs
+    BEST_TRAIN_LOSS=$(grep "Train AvgLoss:" "$WEAVER_LOG" | \
+        sed 's/.*Train AvgLoss: \([0-9.]*\).*/\1/' | sort -n | head -1)
+    LAST_TRAIN_LOSS=$(grep "Train AvgLoss:" "$WEAVER_LOG" | \
+        sed 's/.*Train AvgLoss: \([0-9.]*\).*/\1/' | tail -1)
+    # Get the best validation metric (accuracy)
+    BEST_VAL_METRIC=$(grep "Current validation metric:" "$WEAVER_LOG" | \
+        sed 's/.*best: \([0-9.]*\)).*/\1/' | tail -1)
+    NUM_EPOCHS_DONE=$(grep -c "Train AvgLoss:" "$WEAVER_LOG")
+
+    echo "best_train_loss: ${BEST_TRAIN_LOSS:-N/A}"
+    echo "last_train_loss: ${LAST_TRAIN_LOSS:-N/A}"
+    echo "best_val_metric: ${BEST_VAL_METRIC:-N/A}"
+    echo "epochs_completed: ${NUM_EPOCHS_DONE:-0}"
+    echo "weaver_log: $WEAVER_LOG"
+fi
+echo "===== END_RESULT ====="
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     touch "$CHECKPOINT_DIR/training_complete.flag"
