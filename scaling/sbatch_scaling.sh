@@ -16,16 +16,24 @@
 # =============================================================================
 # Chinchilla Scaling Law Study v2 - Single Run Script
 #
+# Each run creates a self-contained timestamped directory under OUTPUT_BASE:
+#   {OUTPUT_BASE}/runs/{RUN_NAME}_{TIMESTAMP}/
+#       checkpoints/     model .pt files
+#       logs/            weaver text logs (.log.000, .log.001, ...)
+#       tensorboard/     TensorBoard event files
+#       config.txt       run configuration snapshot
+#       training_complete.flag   (created on success)
+#
 # Usage:
-#   sbatch sbatch_scaling.sh <model_size> <data_budget> [options...]
+#   sbatch sbatch_scaling.sh <model_size> <data_budget> [extra weaver args...]
 #
 # Required args:
 #   model_size:   nano, micro, tiny, small, base, large, xlarge
 #   data_budget:  5M, 10M, 25M, 50M, 100M, 250M, 500M
 #
 # Optional env vars (set before sbatch or export):
-#   SAMPLE_TYPE:  Pythia (default), Herwig, Mixed
-#   FEATURE_TYPE: full (default), kinpid, kin
+#   SAMPLE_TYPE:   Pythia (default), Herwig, Mixed
+#   FEATURE_TYPE:  full (default), kinpid, kin
 #   PAIR_FEATURES: 1 (default, with pairwise), 0 (without pairwise)
 #
 # Examples:
@@ -70,16 +78,6 @@ case "$PAIR_FEATURES" in
     *) echo "Error: Invalid PAIR_FEATURES '$PAIR_FEATURES' (0 or 1)"; exit 1 ;;
 esac
 
-# ---- Structured header (parseable by plot_scaling_laws.py) ----
-echo "===== SCALING_RUN_CONFIG ====="
-echo "model_size: $MODEL_SIZE"
-echo "data_budget: $DATA_BUDGET"
-echo "sample_type: $SAMPLE_TYPE"
-echo "feature_type: $FEATURE_TYPE"
-echo "pair_features: $PAIR_FEATURES"
-echo "slurm_job_id: ${SLURM_JOB_ID:-local}"
-echo "===== END_CONFIG ====="
-
 # ---- Environment Setup ----
 REPO_DIR="/global/homes/s/sqian/jetclass_dir/particle_transformer"
 cd "$REPO_DIR"
@@ -87,16 +85,15 @@ cd "$REPO_DIR"
 export DDP_NGPUS=4
 NGPUS=$DDP_NGPUS
 
-# ---- Output Directories ----
-export OUTPUT_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2"
-mkdir -p "$OUTPUT_BASE/slurm_logs"
-
-# Build run name from all dimensions
+# ---- Build run name ----
 PAIR_TAG="pair"
 [[ "$PAIR_FEATURES" == "0" ]] && PAIR_TAG="nopair"
 RUN_NAME="${MODEL_SIZE}_${DATA_BUDGET}_${SAMPLE_TYPE}_${FEATURE_TYPE}_${PAIR_TAG}"
 
-# Unique timestamp (preserved across requeueing)
+# ---- Timestamped run directory (preserved across requeueing) ----
+export OUTPUT_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2"
+mkdir -p "$OUTPUT_BASE/slurm_logs"
+
 TIMESTAMP_FILE="$OUTPUT_BASE/timestamps/TIMESTAMP_${SLURM_JOB_ID}"
 mkdir -p "$(dirname "$TIMESTAMP_FILE")"
 if [ -f "$TIMESTAMP_FILE" ]; then
@@ -108,24 +105,48 @@ else
     echo "New timestamp: $TIMESTAMP"
 fi
 
-export CHECKPOINT_DIR="$OUTPUT_BASE/checkpoints/${RUN_NAME}_${TIMESTAMP}"
-export LOG_DIR="$OUTPUT_BASE/logs"
-export TENSORBOARD_DIR="$OUTPUT_BASE/tensorboard"
-mkdir -p "$CHECKPOINT_DIR" "$LOG_DIR" "$TENSORBOARD_DIR"
-export MODEL_PREFIX="$CHECKPOINT_DIR/net"
+# Everything for this run lives under one directory
+RUN_DIR="$OUTPUT_BASE/runs/${RUN_NAME}_${TIMESTAMP}"
+mkdir -p "$RUN_DIR/checkpoints" "$RUN_DIR/logs" "$RUN_DIR/tensorboard"
+export MODEL_PREFIX="$RUN_DIR/checkpoints/net"
+
+# ---- Structured header (parseable by plot_scaling_laws.py) ----
+echo "===== SCALING_RUN_CONFIG ====="
+echo "model_size: $MODEL_SIZE"
+echo "data_budget: $DATA_BUDGET"
+echo "sample_type: $SAMPLE_TYPE"
+echo "feature_type: $FEATURE_TYPE"
+echo "pair_features: $PAIR_FEATURES"
+echo "slurm_job_id: ${SLURM_JOB_ID:-local}"
+echo "run_dir: $RUN_DIR"
+echo "===== END_CONFIG ====="
+
+# Save config snapshot to run dir
+cat > "$RUN_DIR/config.txt" <<EOF
+model_size: $MODEL_SIZE
+data_budget: $DATA_BUDGET
+sample_type: $SAMPLE_TYPE
+feature_type: $FEATURE_TYPE
+pair_features: $PAIR_FEATURES
+pair_tag: $PAIR_TAG
+run_name: $RUN_NAME
+timestamp: $TIMESTAMP
+slurm_job_id: ${SLURM_JOB_ID:-local}
+repo_dir: $REPO_DIR
+EOF
 
 echo "Run: $RUN_NAME"
-echo "Checkpoint: $CHECKPOINT_DIR"
+echo "Run dir: $RUN_DIR"
 
 # ---- Check for existing checkpoints (resume support) ----
-if ls "$CHECKPOINT_DIR"/*.pt 1> /dev/null 2>&1; then
+if ls "$RUN_DIR/checkpoints"/*.pt 1> /dev/null 2>&1; then
     echo "Found existing checkpoints"
 fi
 
 # ---- Requeue Handler ----
 export max_restarts=9
 function requeue () {
-    if [ -f "$CHECKPOINT_DIR/training_complete.flag" ]; then
+    if [ -f "$RUN_DIR/training_complete.flag" ]; then
         echo "Training complete. Not requeuing."
         exit 0
     fi
@@ -147,7 +168,6 @@ conda activate weaver
 DATADIR="/pscratch/sd/s/sqian/part_datasets/JetClass"
 JET_CLASSES="HToBB HToCC HToGG HToWW2Q1L HToWW4Q TTBar TTBarLep WToQQ ZToQQ ZJetsToNuNu"
 
-# Build --data-train arguments based on SAMPLE_TYPE
 DATA_TRAIN_ARGS=()
 DATA_VAL_ARGS=()
 DATA_TEST_ARGS=()
@@ -171,7 +191,6 @@ case "$SAMPLE_TYPE" in
         UNIQUE_SAMPLES=100000000
         ;;
     Mixed)
-        # Both Pythia and Herwig -> 200M unique training samples
         add_sample_paths "Pythia"
         add_sample_paths "Herwig"
         UNIQUE_SAMPLES=200000000
@@ -232,6 +251,19 @@ echo "Samples/epoch (per GPU): $samples_per_epoch, Epochs: $num_epochs"
 echo "Total training samples: $TOTAL_SAMPLES"
 echo "Data reuse: $DATA_REUSE"
 
+# Append training params to config snapshot
+cat >> "$RUN_DIR/config.txt" <<EOF
+network_config: $network_config
+batch_size: $batch_size
+start_lr: $start_lr
+samples_per_epoch: $samples_per_epoch
+num_epochs: $num_epochs
+total_samples: $TOTAL_SAMPLES
+unique_samples: $UNIQUE_SAMPLES
+data_reuse: $DATA_REUSE
+ngpus: $NGPUS
+EOF
+
 # ---- DDP Command ----
 if ((NGPUS > 1)); then
     if command -v torchrun &> /dev/null; then
@@ -252,6 +284,10 @@ restarts=${restarts:-0}
 echo "Restart count: $restarts"
 
 # ---- Launch Training ----
+# All outputs go into the timestamped RUN_DIR:
+#   checkpoints -> RUN_DIR/checkpoints/net_epoch-N_state.pt
+#   text logs   -> RUN_DIR/logs/{auto}.log.000
+#   tensorboard -> RUN_DIR/tensorboard/  (absolute path -> log_dir, not runs/)
 $CMD \
     --data-train "${DATA_TRAIN_ARGS[@]}" \
     --data-val "${DATA_VAL_ARGS[@]}" \
@@ -268,9 +304,9 @@ $CMD \
     --gpus 0 \
     --optimizer ranger \
     --use-amp \
-    --log "${LOG_DIR}/${RUN_NAME}_{auto}.log" \
+    --log "$RUN_DIR/logs/{auto}.log" \
     --predict-output pred.root \
-    --tensorboard "${TENSORBOARD_DIR}/${RUN_NAME}" \
+    --tensorboard "$RUN_DIR/tensorboard" \
     "${@:3}"
 
 TRAIN_EXIT_CODE=$?
@@ -279,17 +315,16 @@ TRAIN_EXIT_CODE=$?
 echo ""
 echo "===== SCALING_RUN_RESULT ====="
 echo "run_name: $RUN_NAME"
+echo "run_dir: $RUN_DIR"
 echo "exit_code: $TRAIN_EXIT_CODE"
 
 # Extract final losses from the rank-0 weaver log
-WEAVER_LOG=$(ls -t "${LOG_DIR}/${RUN_NAME}_"*.log.000 2>/dev/null | head -1)
+WEAVER_LOG=$(ls -t "$RUN_DIR"/logs/*.log.000 2>/dev/null | head -1)
 if [ -n "$WEAVER_LOG" ] && [ -f "$WEAVER_LOG" ]; then
-    # Get the best (lowest) training loss across all epochs
     BEST_TRAIN_LOSS=$(grep "Train AvgLoss:" "$WEAVER_LOG" | \
         sed 's/.*Train AvgLoss: \([0-9.]*\).*/\1/' | sort -n | head -1)
     LAST_TRAIN_LOSS=$(grep "Train AvgLoss:" "$WEAVER_LOG" | \
         sed 's/.*Train AvgLoss: \([0-9.]*\).*/\1/' | tail -1)
-    # Get the best validation metric (accuracy)
     BEST_VAL_METRIC=$(grep "Current validation metric:" "$WEAVER_LOG" | \
         sed 's/.*best: \([0-9.]*\)).*/\1/' | tail -1)
     NUM_EPOCHS_DONE=$(grep -c "Train AvgLoss:" "$WEAVER_LOG")
@@ -303,7 +338,7 @@ fi
 echo "===== END_RESULT ====="
 
 if [ $TRAIN_EXIT_CODE -eq 0 ]; then
-    touch "$CHECKPOINT_DIR/training_complete.flag"
+    touch "$RUN_DIR/training_complete.flag"
     echo "Training completed successfully"
 else
     echo "Training exited with code $TRAIN_EXIT_CODE"

@@ -125,9 +125,9 @@ for sample in "${SAMPLES[@]}"; do
                     [[ "$pair" == "0" ]] && pair_tag="nopair"
                     run_name="${model}_${budget}_${sample}_${feature}_${pair_tag}"
 
-                    # Skip if already completed
-                    CHECKPOINT_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/checkpoints"
-                    if ls "$CHECKPOINT_BASE"/${run_name}_*/training_complete.flag 1>/dev/null 2>&1; then
+                    # Skip if already completed (check timestamped run dirs)
+                    RUNS_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/runs"
+                    if ls "$RUNS_BASE"/${run_name}_*/training_complete.flag 1>/dev/null 2>&1; then
                         SKIPPED=$((SKIPPED + 1))
                         continue
                     fi

@@ -381,6 +381,105 @@ def collect_from_text_logs(results_dir, sample_type='Pythia', feature_type='full
     return results
 
 
+def collect_from_run_dirs(results_dir):
+    """
+    Scan v2 timestamped run directories under {results_dir}/runs/.
+
+    Each run dir has the structure:
+        {results_dir}/runs/{RUN_NAME}_{TIMESTAMP}/
+            config.txt          key: value pairs
+            logs/*.log.000      weaver rank-0 text log
+            tensorboard/        TensorBoard event files
+            training_complete.flag  (if finished)
+
+    Tries TensorBoard for val loss first, falls back to text log train loss.
+    Returns list of result dicts.
+    """
+    runs_base = os.path.join(results_dir, 'runs')
+    if not os.path.isdir(runs_base):
+        return []
+
+    train_loss_re = re.compile(r'Train AvgLoss: ([\d.]+)')
+    results = []
+
+    for run_dir_name in sorted(os.listdir(runs_base)):
+        run_dir = os.path.join(runs_base, run_dir_name)
+        config_file = os.path.join(run_dir, 'config.txt')
+        if not os.path.isfile(config_file):
+            continue
+
+        # Parse config.txt
+        config = {}
+        with open(config_file, 'r') as f:
+            for line in f:
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    config[k.strip()] = v.strip()
+
+        model = config.get('model_size')
+        budget = config.get('data_budget')
+        sample_type = config.get('sample_type', 'Pythia')
+        feature_type = config.get('feature_type', 'full')
+        pair_tag = config.get('pair_tag', 'pair')
+
+        if not model or not budget:
+            continue
+
+        total_samples = BUDGET_TO_TOTAL_SAMPLES.get(
+            budget, float(budget.replace('M', '')) * 1e6)
+
+        best_loss = None
+        source = None
+
+        # Try TensorBoard (val loss) first
+        tb_dir = os.path.join(run_dir, 'tensorboard')
+        if os.path.isdir(tb_dir) and glob.glob(os.path.join(tb_dir, 'events.out.tfevents*')):
+            try:
+                from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+                ea = EventAccumulator(tb_dir)
+                ea.Reload()
+                available = ea.Tags().get('scalars', [])
+                if 'Loss/eval (epoch)' in available:
+                    events = ea.Scalars('Loss/eval (epoch)')
+                    if events:
+                        best_loss = min(e.value for e in events)
+                        source = 'run_dir (val loss)'
+            except Exception:
+                pass
+
+        # Fallback: text logs (train loss)
+        if best_loss is None:
+            log_files = sorted(glob.glob(os.path.join(run_dir, 'logs', '*.log.000')))
+            losses = []
+            for lf in log_files:
+                try:
+                    with open(lf, 'r') as fh:
+                        for line in fh:
+                            m = train_loss_re.search(line)
+                            if m:
+                                losses.append(float(m.group(1)))
+                except Exception:
+                    continue
+            if losses:
+                best_loss = min(losses)
+                source = 'run_dir (train loss)'
+
+        if best_loss is not None:
+            results.append({
+                'model': model,
+                'budget_label': budget,
+                'sample_type': sample_type,
+                'feature_type': feature_type,
+                'pair_tag': pair_tag,
+                'params_M': PARAMS_M.get(model, 1.0),
+                'total_samples': total_samples,
+                'best_val_loss': best_loss,
+                'source': source,
+            })
+
+    return results
+
+
 def collect_all(results_dirs, from_slurm=None):
     """
     Collect results from all available sources across v1 and v2 directories.
@@ -400,10 +499,15 @@ def collect_all(results_dirs, from_slurm=None):
         for rdir in results_dirs:
             if not os.path.isdir(rdir):
                 continue
-            label = os.path.basename(rdir)
             print(f"\nSearching {rdir}...")
 
-            # Try TensorBoard first
+            # Primary: scan timestamped run directories (v2 layout)
+            run_results = collect_from_run_dirs(rdir)
+            if run_results:
+                print(f"  Run dirs: {len(run_results)} runs")
+                all_results.extend(run_results)
+
+            # Fallback: TensorBoard in flat layout or local runs/
             for st in SAMPLE_TYPES:
                 for ft in FEATURE_TYPES:
                     for pt in PAIR_TAGS:
@@ -412,7 +516,7 @@ def collect_all(results_dirs, from_slurm=None):
                             print(f"  TB: {len(tb_results)} runs ({st}/{ft}/{pt})")
                             all_results.extend(tb_results)
 
-            # Then text logs
+            # Fallback: text logs in flat layout (v1)
             for st in SAMPLE_TYPES:
                 for ft in FEATURE_TYPES:
                     for pt in PAIR_TAGS:
@@ -421,7 +525,7 @@ def collect_all(results_dirs, from_slurm=None):
                             print(f"  Text: {len(txt_results)} runs ({st}/{ft}/{pt})")
                             all_results.extend(txt_results)
 
-            # Then SLURM logs
+            # Fallback: SLURM logs
             slurm_dir = os.path.join(rdir, 'slurm_logs')
             if os.path.isdir(slurm_dir):
                 slurm_files = sorted(glob.glob(os.path.join(slurm_dir, 'slurm-*.out')))
