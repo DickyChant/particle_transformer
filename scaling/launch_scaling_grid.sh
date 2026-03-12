@@ -1,15 +1,39 @@
 #!/bin/bash
 # =============================================================================
+#
+#    ____            _   _      _        _____                     __
+#   |  _ \ __ _ _ __| |_(_) ___| | ___  |_   _| __ __ _ _ __  ___ / _| ___  _ __ _ __ ___   ___ _ __
+#   | |_) / _` | '__| __| |/ __| |/ _ \   | || '__/ _` | '_ \/ __| |_ / _ \| '__| '_ ` _ \ / _ \ '__|
+#   |  __/ (_| | |  | |_| | (__| |  __/   | || | | (_| | | | \__ \  _| (_) | |  | | | | | |  __/ |
+#   |_|   \__,_|_|   \__|_|\___|_|\___|   |_||_|  \__,_|_| |_|___/_|  \___/|_|  |_| |_| |_|\___|_|
+#
+#        _____ _     _            _     _ _ _          ____            _ _
+#       / ____| |   (_)          | |   (_) | |        / ___|  ___ __ _| (_)_ __   __ _
+#      | |    | |__  _ _ __   ___| |__  _| | | __ _   \___ \ / __/ _` | | | '_ \ / _` |
+#      | |    | '_ \| | '_ \ / __| '_ \| | | |/ _` |  ___) | (_| (_| | | | | | | (_| |
+#       \____|_| |_|_|_| |_|\___|_| |_|_|_|_|\__,_| |____/ \___\__,_|_|_|_| |_|\__, |
+#                                                                                 |___/
+#               L(N, D) = A * N^(-alpha) + B * D^(-beta) + E
+#
+# =============================================================================
+#
 # Launch full grid of scaling law study jobs
 #
-# Dimensions:
-#   Model sizes:    nano, micro, tiny, small, base, large, xlarge  (7)
-#   Data budgets:   5M, 10M, 25M, 50M, 100M, 250M, 500M           (7)
-#   Sample types:   Pythia, Herwig, Mixed                           (3)
-#   Feature types:  kin, kinpid, full                               (3)
-#   Pairwise:       1 (with), 0 (without)                           (2)
+#   Model sizes  :  nano  micro  tiny  small  base  large  xlarge   (7)
+#   Data budgets :  5M  10M  25M  50M  100M  250M  500M            (7)
+#   Sample types :  Pythia  Herwig  Mixed                           (3)
+#   Feature types:  kin  kinpid  full                               (3)
+#   Pairwise     :  pair  nopair                                    (2)
 #
-# Full grid = 7 * 7 * 3 * 3 * 2 = 882 jobs
+#   Full grid = 7 x 7 x 3 x 3 x 2 = 882 jobs
+#
+#        model   data
+#        size    budget   sample    features   pair?
+#       +------+--------+---------+----------+------+
+#       | nano |  5M    | Pythia  | kin      | pair |
+#       | ...  |  ...   | Herwig  | kinpid   |nopair|
+#       |xlarge| 500M   | Mixed   | full     |      |
+#       +------+--------+---------+----------+------+
 #
 # Usage:
 #   ./launch_scaling_grid.sh [--dry-run] [--subset SUBSET]
@@ -123,10 +147,19 @@ for sample in "${SAMPLES[@]}"; do
 done
 
 echo ""
-echo "Grid: $SUBSET"
-echo "Total configurations: $TOTAL"
-echo "Already completed: $SKIPPED"
-echo "Submitted: $SUBMITTED"
+echo "  ================================================================"
+echo "       _                        _                   _"
+echo "      | | ___  _ __ ___   ___  | |__   _____      _| |"
+echo "      | |/ _ \| '_ \` _ \ / _ \ | '_ \ / _ \ \ /\ / / |"
+echo "      | | (_) | | | | | |  __/ | | | | (_) \ V  V /|_|"
+echo "      |_|\___/|_| |_| |_|\___| |_| |_|\___/ \_/\_/ (_)"
+echo ""
+echo "         Grid subset:  $SUBSET"
+echo "         Total configs: $TOTAL"
+printf "         Completed:     %s\n" "$SKIPPED"
+printf "         Submitted:     %s\n" "$SUBMITTED"
 if $DRY_RUN; then
-    echo "(dry run - no jobs actually submitted)"
+    echo ""
+    echo "         (dry run - no jobs actually submitted)"
 fi
+echo "  ================================================================"
