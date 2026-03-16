@@ -44,12 +44,14 @@
 #   sample      All sample types, full features, pair (147 jobs)
 #   features    Pythia, all feature types, pair+nopair (294 jobs)
 #   quick       Small grid: {nano,small,base} x {5M,50M,500M} x Pythia x full x pair (9 jobs)
+#   oneepoch    Like baseline but NUM_EPOCHS=1: single pass through data (49 jobs)
 # =============================================================================
 
 set -euo pipefail
 
 DRY_RUN=false
 SUBSET="baseline"
+EXTRA_ENV=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -102,9 +104,17 @@ case "$SUBSET" in
         FEATURES=(full)
         PAIRS=(1)
         ;;
+    oneepoch)
+        MODELS=(nano micro tiny small base large xlarge)
+        BUDGETS=(5M 10M 25M 50M 100M)
+        SAMPLES=(Pythia)
+        FEATURES=(full)
+        PAIRS=(1)
+        EXTRA_ENV="NUM_EPOCHS=1"
+        ;;
     *)
         echo "Unknown subset: $SUBSET"
-        echo "Valid: all, baseline, sample, features, quick"
+        echo "Valid: all, baseline, sample, features, quick, oneepoch"
         exit 1
         ;;
 esac
@@ -123,7 +133,10 @@ for sample in "${SAMPLES[@]}"; do
 
                     pair_tag="pair"
                     [[ "$pair" == "0" ]] && pair_tag="nopair"
-                    run_name="${model}_${budget}_${sample}_${feature}_${pair_tag}"
+                    epoch_tag=""
+                    [[ -n "$EXTRA_ENV" ]] && epoch_tag=$(echo "$EXTRA_ENV" | grep -oP 'NUM_EPOCHS=\K\d+' | head -1)
+                    [[ -n "$epoch_tag" ]] && epoch_tag="_${epoch_tag}ep"
+                    run_name="${model}_${budget}_${sample}_${feature}_${pair_tag}${epoch_tag}"
 
                     # Skip if already completed (check timestamped run dirs)
                     RUNS_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/runs"
@@ -133,9 +146,9 @@ for sample in "${SAMPLES[@]}"; do
                     fi
 
                     if $DRY_RUN; then
-                        echo "[DRY-RUN] SAMPLE_TYPE=$sample FEATURE_TYPE=$feature PAIR_FEATURES=$pair sbatch $SBATCH_SCRIPT $model $budget"
+                        echo "[DRY-RUN] ${EXTRA_ENV:+$EXTRA_ENV }SAMPLE_TYPE=$sample FEATURE_TYPE=$feature PAIR_FEATURES=$pair sbatch $SBATCH_SCRIPT $model $budget"
                     else
-                        SAMPLE_TYPE=$sample FEATURE_TYPE=$feature PAIR_FEATURES=$pair \
+                        env SAMPLE_TYPE=$sample FEATURE_TYPE=$feature PAIR_FEATURES=$pair $EXTRA_ENV \
                             sbatch --job-name="scl-${run_name}" \
                             "$SBATCH_SCRIPT" "$model" "$budget"
                     fi

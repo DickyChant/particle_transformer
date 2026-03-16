@@ -47,7 +47,7 @@ from scipy.optimize import curve_fit
 
 RESULTS_DIR_V1 = '/pscratch/sd/s/sqian/part_training_output/scaling_study'
 RESULTS_DIR_V2 = '/pscratch/sd/s/sqian/part_training_output/scaling_study_v2'
-OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = '/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/plots'
 
 MODEL_SIZES = ['nano', 'micro', 'tiny', 'small', 'base', 'large', 'xlarge']
 DATA_BUDGETS = ['5M', '10M', '25M', '50M', '100M', '250M', '500M']
@@ -72,12 +72,40 @@ BUDGET_TO_TOTAL_SAMPLES = {
     '500M': 512_000_000,
 }
 
+# Default epoch config: (samples_per_epoch_per_gpu, num_epochs, ngpus=4)
+# total_per_epoch = samples_per_epoch * ngpus
+BUDGET_EPOCH_CONFIG = {
+    '5M':   (320_000,   4),
+    '10M':  (640_000,   4),
+    '25M':  (1_600_000, 4),
+    '50M':  (1_600_000, 8),
+    '100M': (1_600_000, 16),
+    '250M': (1_600_000, 40),
+    '500M': (2_560_000, 50),
+}
+DEFAULT_NGPUS = 4
+
 # Unique training samples per sample type
 UNIQUE_SAMPLES = {
     'Pythia': 100_000_000,
     'Herwig': 100_000_000,
     'Mixed':  200_000_000,
 }
+
+
+def _samples_at_epoch(budget_label, epoch, config=None):
+    """Compute total samples seen through epoch N (0-indexed).
+    Uses config dict (from config.txt) if available, else falls back to defaults."""
+    if config:
+        spe = int(config.get('samples_per_epoch', 0))
+        ngpus = int(config.get('ngpus', DEFAULT_NGPUS))
+        if spe > 0:
+            return spe * ngpus * (epoch + 1)
+    # Fallback to known defaults
+    if budget_label in BUDGET_EPOCH_CONFIG:
+        spe, _ = BUDGET_EPOCH_CONFIG[budget_label]
+        return spe * DEFAULT_NGPUS * (epoch + 1)
+    return None
 
 # ---- Chinchilla scaling law ----
 
@@ -116,7 +144,20 @@ def fit_chinchilla(N, D, L):
 
 # ---- Data collection ----
 
-def _parse_v2_slurm_log(filepath):
+def _select_loss(losses, epoch=None):
+    """Pick a loss from a list of per-epoch losses.
+    epoch=None -> min (best), epoch=N -> losses[N] (0-indexed).
+    Returns (value, source_suffix) or (None, '')."""
+    if not losses:
+        return None, ''
+    if epoch is not None:
+        if epoch < len(losses):
+            return losses[epoch], f', epoch {epoch}'
+        return None, ''
+    return min(losses), ''
+
+
+def _parse_v2_slurm_log(filepath, epoch=None):
     """
     Parse a v2 SLURM log with structured SCALING_RUN_CONFIG/RESULT blocks.
     Returns a dict or None.
@@ -180,11 +221,18 @@ def _parse_v2_slurm_log(filepath):
                 pass
 
     if train_losses:
-        best_loss = min(train_losses)
+        selected, suffix = _select_loss(train_losses, epoch)
+        if selected is not None:
+            best_loss = selected
     if best_loss is None:
         return None
 
-    total_samples = BUDGET_TO_TOTAL_SAMPLES.get(budget, float(budget.replace('M', '')) * 1e6)
+    if epoch is not None:
+        total_samples = _samples_at_epoch(budget, epoch)
+        if total_samples is None:
+            return None
+    else:
+        total_samples = BUDGET_TO_TOTAL_SAMPLES.get(budget, float(budget.replace('M', '')) * 1e6)
     return {
         'model': model,
         'budget_label': budget,
@@ -194,11 +242,11 @@ def _parse_v2_slurm_log(filepath):
         'params_M': PARAMS_M.get(model, 1.0),
         'total_samples': total_samples,
         'best_val_loss': best_loss,
-        'source': 'v2_slurm',
+        'source': f'v2_slurm{suffix}',
     }
 
 
-def _parse_v1_slurm_log(filepath):
+def _parse_v1_slurm_log(filepath, epoch=None):
     """
     Parse a v1 SLURM log (old format with 'Model size:' / 'Data budget:' headers).
     Returns a dict or None. Assumes Pythia/full/pair defaults.
@@ -239,7 +287,16 @@ def _parse_v1_slurm_log(filepath):
     if not model or not budget or not losses:
         return None
 
-    total_samples = BUDGET_TO_TOTAL_SAMPLES.get(budget, float(budget.replace('M', '')) * 1e6)
+    selected, suffix = _select_loss(losses, epoch)
+    if selected is None:
+        return None
+
+    if epoch is not None:
+        total_samples = _samples_at_epoch(budget, epoch)
+        if total_samples is None:
+            return None
+    else:
+        total_samples = BUDGET_TO_TOTAL_SAMPLES.get(budget, float(budget.replace('M', '')) * 1e6)
     return {
         'model': model,
         'budget_label': budget,
@@ -248,18 +305,18 @@ def _parse_v1_slurm_log(filepath):
         'pair_tag': 'pair',
         'params_M': PARAMS_M.get(model, 1.0),
         'total_samples': total_samples,
-        'best_val_loss': min(losses),
-        'source': 'v1_slurm',
+        'best_val_loss': selected,
+        'source': f'v1_slurm{suffix}',
     }
 
 
-def collect_from_slurm_logs(slurm_files):
+def collect_from_slurm_logs(slurm_files, epoch=None):
     """Parse a list of SLURM log files (auto-detects v1 vs v2 format)."""
     results = []
     for f in slurm_files:
-        entry = _parse_v2_slurm_log(f)
+        entry = _parse_v2_slurm_log(f, epoch=epoch)
         if entry is None:
-            entry = _parse_v1_slurm_log(f)
+            entry = _parse_v1_slurm_log(f, epoch=epoch)
         if entry is not None:
             results.append(entry)
     return results
@@ -273,20 +330,10 @@ def _find_tb_run_dirs(results_dir, run_name):
     if os.path.isdir(tb_dir):
         candidates.append(tb_dir)
 
-    # Weaver local runs/ directory (nested path structure)
-    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    runs_dir = os.path.join(repo_dir, 'runs')
-    if os.path.isdir(runs_dir):
-        for ts_dir in os.listdir(runs_dir):
-            nested = glob.glob(os.path.join(runs_dir, ts_dir, '**', run_name), recursive=True)
-            for d in nested:
-                if os.path.isdir(d) and glob.glob(os.path.join(d, 'events.out.tfevents*')):
-                    candidates.append(d)
-
     return candidates
 
 
-def collect_from_tensorboard(results_dir, sample_type='Pythia', feature_type='full', pair_tag='pair'):
+def collect_from_tensorboard(results_dir, sample_type='Pythia', feature_type='full', pair_tag='pair', epoch=None):
     """Parse TensorBoard event files for validation loss."""
     try:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
@@ -296,12 +343,21 @@ def collect_from_tensorboard(results_dir, sample_type='Pythia', feature_type='fu
 
     results = []
     for model_size in MODEL_SIZES:
-        for budget_label, total_samples in BUDGET_TO_TOTAL_SAMPLES.items():
-            # v2 run names include all dimensions; v1 is just model_budget
+        for budget_label in BUDGET_TO_TOTAL_SAMPLES:
+            if epoch is not None:
+                total_samples = _samples_at_epoch(budget_label, epoch)
+                if total_samples is None:
+                    continue
+            else:
+                total_samples = BUDGET_TO_TOTAL_SAMPLES[budget_label]
+
+            # v2 naming includes all dimensions; v1 is just model_budget
+            # Only fall back to v1 name for the default config (Pythia/full/pair)
             run_names = [
                 f'{model_size}_{budget_label}_{sample_type}_{feature_type}_{pair_tag}',
-                f'{model_size}_{budget_label}',
             ]
+            if (sample_type, feature_type, pair_tag) == ('Pythia', 'full', 'pair'):
+                run_names.append(f'{model_size}_{budget_label}')
 
             best_val_loss = None
             for run_name in run_names:
@@ -313,13 +369,21 @@ def collect_from_tensorboard(results_dir, sample_type='Pythia', feature_type='fu
                         if 'Loss/eval (epoch)' in available:
                             events = ea.Scalars('Loss/eval (epoch)')
                             if events:
-                                run_best = min(e.value for e in events)
-                                if best_val_loss is None or run_best < best_val_loss:
-                                    best_val_loss = run_best
+                                if epoch is not None:
+                                    epoch_events = [e for e in events if e.step == epoch]
+                                    if epoch_events:
+                                        run_val = epoch_events[0].value
+                                    else:
+                                        continue
+                                else:
+                                    run_val = min(e.value for e in events)
+                                if best_val_loss is None or run_val < best_val_loss:
+                                    best_val_loss = run_val
                     except Exception:
                         continue
 
             if best_val_loss is not None:
+                suffix = f', epoch {epoch}' if epoch is not None else ''
                 results.append({
                     'model': model_size,
                     'budget_label': budget_label,
@@ -329,13 +393,13 @@ def collect_from_tensorboard(results_dir, sample_type='Pythia', feature_type='fu
                     'params_M': PARAMS_M.get(model_size, 1.0),
                     'total_samples': total_samples,
                     'best_val_loss': best_val_loss,
-                    'source': 'tensorboard',
+                    'source': f'tensorboard{suffix}',
                 })
 
     return results
 
 
-def collect_from_text_logs(results_dir, sample_type='Pythia', feature_type='full', pair_tag='pair'):
+def collect_from_text_logs(results_dir, sample_type='Pythia', feature_type='full', pair_tag='pair', epoch=None):
     """Parse weaver text logs (.log.000 files) for training loss."""
     log_dir = os.path.join(results_dir, 'logs')
     if not os.path.isdir(log_dir):
@@ -345,12 +409,21 @@ def collect_from_text_logs(results_dir, sample_type='Pythia', feature_type='full
     results = []
 
     for model_size in MODEL_SIZES:
-        for budget_label, total_samples in BUDGET_TO_TOTAL_SAMPLES.items():
-            # Try both v2 and v1 naming conventions
+        for budget_label in BUDGET_TO_TOTAL_SAMPLES:
+            if epoch is not None:
+                total_samples = _samples_at_epoch(budget_label, epoch)
+                if total_samples is None:
+                    continue
+            else:
+                total_samples = BUDGET_TO_TOTAL_SAMPLES[budget_label]
+
+            # v2 naming includes all dimensions; v1 is just model_budget
+            # Only fall back to v1 name for the default config (Pythia/full/pair)
             run_names = [
                 f'{model_size}_{budget_label}_{sample_type}_{feature_type}_{pair_tag}',
-                f'{model_size}_{budget_label}',
             ]
+            if (sample_type, feature_type, pair_tag) == ('Pythia', 'full', 'pair'):
+                run_names.append(f'{model_size}_{budget_label}')
 
             losses = []
             for run_name in run_names:
@@ -366,22 +439,24 @@ def collect_from_text_logs(results_dir, sample_type='Pythia', feature_type='full
                         continue
 
             if losses:
-                results.append({
-                    'model': model_size,
-                    'budget_label': budget_label,
-                    'sample_type': sample_type,
-                    'feature_type': feature_type,
-                    'pair_tag': pair_tag,
-                    'params_M': PARAMS_M.get(model_size, 1.0),
-                    'total_samples': total_samples,
-                    'best_val_loss': min(losses),
-                    'source': 'text_log (train loss)',
-                })
+                selected, suffix = _select_loss(losses, epoch)
+                if selected is not None:
+                    results.append({
+                        'model': model_size,
+                        'budget_label': budget_label,
+                        'sample_type': sample_type,
+                        'feature_type': feature_type,
+                        'pair_tag': pair_tag,
+                        'params_M': PARAMS_M.get(model_size, 1.0),
+                        'total_samples': total_samples,
+                        'best_val_loss': selected,
+                        'source': f'text_log (train loss{suffix})',
+                    })
 
     return results
 
 
-def collect_from_run_dirs(results_dir):
+def collect_from_run_dirs(results_dir, epoch=None):
     """
     Scan v2 timestamped run directories under {results_dir}/runs/.
 
@@ -425,8 +500,13 @@ def collect_from_run_dirs(results_dir):
         if not model or not budget:
             continue
 
-        total_samples = BUDGET_TO_TOTAL_SAMPLES.get(
-            budget, float(budget.replace('M', '')) * 1e6)
+        if epoch is not None:
+            total_samples = _samples_at_epoch(budget, epoch, config)
+            if total_samples is None:
+                continue
+        else:
+            total_samples = BUDGET_TO_TOTAL_SAMPLES.get(
+                budget, float(budget.replace('M', '')) * 1e6)
 
         best_loss = None
         source = None
@@ -442,8 +522,14 @@ def collect_from_run_dirs(results_dir):
                 if 'Loss/eval (epoch)' in available:
                     events = ea.Scalars('Loss/eval (epoch)')
                     if events:
-                        best_loss = min(e.value for e in events)
-                        source = 'run_dir (val loss)'
+                        if epoch is not None:
+                            epoch_events = [e for e in events if e.step == epoch]
+                            if epoch_events:
+                                best_loss = epoch_events[0].value
+                                source = f'run_dir (val loss, epoch {epoch})'
+                        else:
+                            best_loss = min(e.value for e in events)
+                            source = 'run_dir (val loss)'
             except Exception:
                 pass
 
@@ -461,8 +547,10 @@ def collect_from_run_dirs(results_dir):
                 except Exception:
                     continue
             if losses:
-                best_loss = min(losses)
-                source = 'run_dir (train loss)'
+                selected, suffix = _select_loss(losses, epoch)
+                if selected is not None:
+                    best_loss = selected
+                    source = f'run_dir (train loss{suffix})'
 
         if best_loss is not None:
             results.append({
@@ -480,7 +568,7 @@ def collect_from_run_dirs(results_dir):
     return results
 
 
-def collect_all(results_dirs, from_slurm=None):
+def collect_all(results_dirs, from_slurm=None, epoch=None):
     """
     Collect results from all available sources across v1 and v2 directories.
     Returns a DataFrame with columns: model, budget_label, sample_type,
@@ -492,7 +580,7 @@ def collect_all(results_dirs, from_slurm=None):
         slurm_files = []
         for pattern in from_slurm:
             slurm_files.extend(sorted(glob.glob(pattern)))
-        results = collect_from_slurm_logs(slurm_files)
+        results = collect_from_slurm_logs(slurm_files, epoch=epoch)
         print(f"Parsed {len(results)} runs from {len(slurm_files)} SLURM log files")
         all_results.extend(results)
     else:
@@ -502,7 +590,7 @@ def collect_all(results_dirs, from_slurm=None):
             print(f"\nSearching {rdir}...")
 
             # Primary: scan timestamped run directories (v2 layout)
-            run_results = collect_from_run_dirs(rdir)
+            run_results = collect_from_run_dirs(rdir, epoch=epoch)
             if run_results:
                 print(f"  Run dirs: {len(run_results)} runs")
                 all_results.extend(run_results)
@@ -511,7 +599,7 @@ def collect_all(results_dirs, from_slurm=None):
             for st in SAMPLE_TYPES:
                 for ft in FEATURE_TYPES:
                     for pt in PAIR_TAGS:
-                        tb_results = collect_from_tensorboard(rdir, st, ft, pt)
+                        tb_results = collect_from_tensorboard(rdir, st, ft, pt, epoch=epoch)
                         if tb_results:
                             print(f"  TB: {len(tb_results)} runs ({st}/{ft}/{pt})")
                             all_results.extend(tb_results)
@@ -520,7 +608,7 @@ def collect_all(results_dirs, from_slurm=None):
             for st in SAMPLE_TYPES:
                 for ft in FEATURE_TYPES:
                     for pt in PAIR_TAGS:
-                        txt_results = collect_from_text_logs(rdir, st, ft, pt)
+                        txt_results = collect_from_text_logs(rdir, st, ft, pt, epoch=epoch)
                         if txt_results:
                             print(f"  Text: {len(txt_results)} runs ({st}/{ft}/{pt})")
                             all_results.extend(txt_results)
@@ -530,7 +618,7 @@ def collect_all(results_dirs, from_slurm=None):
             if os.path.isdir(slurm_dir):
                 slurm_files = sorted(glob.glob(os.path.join(slurm_dir, 'slurm-*.out')))
                 if slurm_files:
-                    slurm_results = collect_from_slurm_logs(slurm_files)
+                    slurm_results = collect_from_slurm_logs(slurm_files, epoch=epoch)
                     if slurm_results:
                         print(f"  SLURM: {len(slurm_results)} runs")
                         all_results.extend(slurm_results)
@@ -718,6 +806,8 @@ def main():
                         help='Parse SLURM log files directly (glob patterns)')
     parser.add_argument('--filter', nargs='+', default=None,
                         help='Filter runs: key=value pairs (e.g., sample_type=Mixed feature_type=full)')
+    parser.add_argument('--epoch', type=int, default=None,
+                        help='Extract loss from specific epoch (0-indexed). Default: best across all epochs.')
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -725,7 +815,9 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ---- Collect all results ----
-    df = collect_all(args.results_dir, from_slurm=args.from_slurm)
+    if args.epoch is not None:
+        print(f"Extracting epoch {args.epoch} loss (0-indexed)")
+    df = collect_all(args.results_dir, from_slurm=args.from_slurm, epoch=args.epoch)
 
     if df.empty:
         print("No results found.")
@@ -748,6 +840,8 @@ def main():
     print("-" * 80)
 
     # ---- Generate plots per configuration slice ----
+    epoch_tag = f'_epoch{args.epoch}' if args.epoch is not None else ''
+    epoch_label = f' [epoch {args.epoch}]' if args.epoch is not None else ''
     fits = {}
     config_groups = df.groupby(['sample_type', 'feature_type', 'pair_tag'])
 
@@ -757,8 +851,8 @@ def main():
             continue
 
         unique = UNIQUE_SAMPLES.get(st, 100_000_000)
-        config_label = f"{st} / {ft} / {pt}"
-        safe_name = f"{st}_{ft}_{pt}"
+        config_label = f"{st} / {ft} / {pt}{epoch_label}"
+        safe_name = f"{st}_{ft}_{pt}{epoch_tag}"
         output_path = os.path.join(args.output_dir, f'scaling_laws_{safe_name}.png')
 
         print(f"\n--- {config_label} ({len(group)} runs) ---")
@@ -769,13 +863,13 @@ def main():
 
     # ---- Comparison plot across configs ----
     if len(fits) >= 2:
-        plot_comparison(fits, os.path.join(args.output_dir, 'scaling_laws_comparison.png'))
+        plot_comparison(fits, os.path.join(args.output_dir, f'scaling_laws_comparison{epoch_tag}.png'))
 
     # ---- Also generate a combined "all configs" plot if there are multiple ----
     if len(config_groups) > 1 and len(df) >= 5:
         print(f"\n--- All configs combined ({len(df)} runs) ---")
-        plot_scaling_pair(df, 'All configurations',
-                         os.path.join(args.output_dir, 'scaling_laws_all.png'),
+        plot_scaling_pair(df, f'All configurations{epoch_label}',
+                         os.path.join(args.output_dir, f'scaling_laws_all{epoch_tag}.png'),
                          unique_samples=min(UNIQUE_SAMPLES.values()))
 
 

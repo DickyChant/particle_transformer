@@ -88,7 +88,9 @@ NGPUS=$DDP_NGPUS
 # ---- Build run name ----
 PAIR_TAG="pair"
 [[ "$PAIR_FEATURES" == "0" ]] && PAIR_TAG="nopair"
-RUN_NAME="${MODEL_SIZE}_${DATA_BUDGET}_${SAMPLE_TYPE}_${FEATURE_TYPE}_${PAIR_TAG}"
+EPOCH_TAG=""
+[[ -n "${NUM_EPOCHS:-}" ]] && EPOCH_TAG="_${NUM_EPOCHS}ep"
+RUN_NAME="${MODEL_SIZE}_${DATA_BUDGET}_${SAMPLE_TYPE}_${FEATURE_TYPE}_${PAIR_TAG}${EPOCH_TAG}"
 
 # ---- Timestamped run directory (preserved across requeueing) ----
 export OUTPUT_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2"
@@ -228,6 +230,9 @@ fi
 
 # ---- Data Budget Configuration ----
 # Total samples = samples_per_epoch * NGPUS * num_epochs
+# Override with NUM_EPOCHS env var (e.g., NUM_EPOCHS=1 for single-epoch runs)
+NUM_EPOCHS_OVERRIDE="${NUM_EPOCHS:-}"
+
 case "$DATA_BUDGET" in
     5M)   samples_per_epoch=320000;   num_epochs=4  ;;
     10M)  samples_per_epoch=640000;   num_epochs=4  ;;
@@ -237,6 +242,14 @@ case "$DATA_BUDGET" in
     250M) samples_per_epoch=1600000;  num_epochs=40 ;;
     500M) samples_per_epoch=2560000;  num_epochs=50 ;;
 esac
+
+# If NUM_EPOCHS is overridden, recalculate samples_per_epoch so total = budget
+if [[ -n "$NUM_EPOCHS_OVERRIDE" ]]; then
+    num_epochs=$NUM_EPOCHS_OVERRIDE
+    budget_num=${DATA_BUDGET%M}
+    samples_per_epoch=$(( budget_num * 1000000 / NGPUS / num_epochs ))
+    echo "NUM_EPOCHS override: $num_epochs epoch(s), samples_per_epoch=$samples_per_epoch"
+fi
 
 samples_per_epoch_val=1280000
 TOTAL_SAMPLES=$(( samples_per_epoch * NGPUS * num_epochs ))
