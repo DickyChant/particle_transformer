@@ -77,6 +77,9 @@ and the second argument is the input feature sets:
 
 Additional arguments will be passed directly to the `weaver` command, such as `--batch-size`, `--start-lr`, `--gpus`, etc., and will override existing arguments in `train_JetClass.sh`.
 
+To enable residual attention aggregation in the ParT encoder blocks, pass:
+`--network-option use_residual_attn True`.
+
 **Multi-gpu support:**
 
 - using PyTorch's DataParallel multi-gpu training:
