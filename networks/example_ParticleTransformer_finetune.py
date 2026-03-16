@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import importlib
 from weaver.nn.model.ParticleTransformer import ParticleTransformer
 from weaver.utils.logger import _logger
 
@@ -51,6 +50,7 @@ class ParticleTransformerWrapper(nn.Module):
         return output
 
     def _apply_residual_attn(self, states, layer_idx):
+        # s: state-depth index, p: particle/sequence position, n: batch, c: embedding channel
         values = torch.stack(states, dim=0)
         keys = self.residual_attn_norm(values)
         logits = torch.einsum('c,spnc->spn', self.residual_attn_weights[layer_idx], keys)
@@ -60,6 +60,7 @@ class ParticleTransformerWrapper(nn.Module):
     def _forward_with_residual_attn(self, x, v=None, mask=None, uu=None, uu_idx=None):
         with torch.no_grad():
             if not self.mod.for_inference and uu_idx is not None:
+                import importlib
                 part_module = importlib.import_module(ParticleTransformer.__module__)
                 uu = part_module.build_sparse_tensor(uu, uu_idx, x.size(-1))
             x, v, mask, uu = self.mod.trimmer(x, v, mask, uu)
