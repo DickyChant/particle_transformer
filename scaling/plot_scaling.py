@@ -29,6 +29,23 @@ DEFAULT_OUTPUT_DIR = '/pscratch/sd/s/sqian/part_training_output/scaling_study_v2
 MODEL_SIZES = ['nano', 'micro', 'tiny', 'small', 'base', 'large', 'xlarge']
 DATA_BUDGETS = ['5M', '10M', '25M', '50M', '100M', '250M', '500M']
 
+PARAMS_M = {
+    'nano': 0.1, 'micro': 0.2, 'tiny': 0.4,
+    'small': 1.0, 'base': 2.14, 'large': 8.5, 'xlarge': 25.0,
+}
+
+# Default epoch config: (samples_per_epoch_per_gpu, num_epochs, ngpus=4)
+BUDGET_EPOCH_CONFIG = {
+    '5M':   (320_000,   4),
+    '10M':  (640_000,   4),
+    '25M':  (1_600_000, 4),
+    '50M':  (1_600_000, 8),
+    '100M': (1_600_000, 16),
+    '250M': (1_600_000, 40),
+    '500M': (2_560_000, 50),
+}
+DEFAULT_NGPUS = 4
+
 MODEL_COLORS = {
     'nano': '#1f77b4', 'micro': '#ff7f0e', 'tiny': '#2ca02c',
     'small': '#d62728', 'base': '#9467bd', 'large': '#8c564b',
@@ -99,8 +116,36 @@ def select_epoch_data(df, epoch=None):
 
 # ---- Plotting ----
 
-def plot_scaling_pair(df, title_suffix, output_path, unique_samples):
-    """Two-panel: Loss vs Data + Loss vs Model Size."""
+def make_predictions(popt, observed_df, epoch=None):
+    """Generate predictions for missing (model, budget) combos."""
+    if popt is None:
+        return pd.DataFrame()
+
+    observed_keys = set(zip(observed_df['model_size'], observed_df['data_budget']))
+    preds = []
+    for model in MODEL_SIZES:
+        for budget in DATA_BUDGETS:
+            if (model, budget) in observed_keys:
+                continue
+            n_params = PARAMS_M[model]
+            spe, num_ep = BUDGET_EPOCH_CONFIG[budget]
+            if epoch is not None:
+                d_samples = spe * DEFAULT_NGPUS * (epoch + 1)
+            else:
+                d_samples = spe * DEFAULT_NGPUS * num_ep
+            d_m = d_samples / 1e6
+            pred_loss = chinchilla_loss((n_params, d_m), *popt)
+            preds.append({
+                'model_size': model, 'data_budget': budget,
+                'params_M': n_params, 'D_M': d_m,
+                'total_samples_seen': d_samples,
+                'train_loss': pred_loss, 'predicted': True,
+            })
+    return pd.DataFrame(preds)
+
+
+def plot_scaling_pair(df, title_suffix, output_path, unique_samples, pred_df=None):
+    """Two-panel: Loss vs Data + Loss vs Model Size, with optional predictions."""
     N = df['params_M'].values
     D = df['D_M'].values
     L = df['train_loss'].values
@@ -113,9 +158,12 @@ def plot_scaling_pair(df, title_suffix, output_path, unique_samples):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
     unique_M = unique_samples / 1e6
 
-    # Distinct D values for budget coloring on right panel
-    budget_vals = sorted(df['D_M'].unique())
-    budget_cmap = plt.cm.viridis(np.linspace(0.1, 0.9, len(budget_vals)))
+    # Combine observed + predicted D values for right panel coloring
+    all_d_vals = sorted(df['D_M'].unique())
+    if pred_df is not None and not pred_df.empty:
+        all_d_vals = sorted(set(all_d_vals) | set(pred_df['D_M'].unique()))
+    budget_cmap = {d: plt.cm.viridis(i / max(len(all_d_vals) - 1, 1))
+                   for i, d in enumerate(all_d_vals)}
 
     # ---- Left: Loss vs Data ----
     for model in MODEL_SIZES:
@@ -138,12 +186,26 @@ def plot_scaling_pair(df, title_suffix, output_path, unique_samples):
                      markerfacecolor='none', markeredgewidth=1.5,
                      label=f"{model} (reused)" if no_reuse.empty else None)
 
+        # Plot predictions for this model
+        if pred_df is not None and not pred_df.empty:
+            psub = pred_df[pred_df['model_size'] == model].sort_values('D_M')
+            if not psub.empty:
+                ax1.plot(psub['D_M'], psub['train_loss'],
+                         marker='x', ls='', color=c, ms=8, markeredgewidth=2, alpha=0.7)
+
         if popt is not None:
-            d_range = df['D_M']
-            x_fit = np.logspace(np.log10(max(d_range.min() * 0.8, 0.5)),
-                                np.log10(d_range.max() * 1.2), 50)
+            d_all = list(df['D_M'])
+            if pred_df is not None and not pred_df.empty:
+                d_all += list(pred_df['D_M'])
+            x_fit = np.logspace(np.log10(max(min(d_all) * 0.8, 0.5)),
+                                np.log10(max(d_all) * 1.2), 50)
             ax1.plot(x_fit, chinchilla_loss((n_params, x_fit), *popt),
                      color=c, alpha=0.6, ls='--')
+
+    # Add a single legend entry for predictions
+    if pred_df is not None and not pred_df.empty:
+        ax1.plot([], [], marker='x', ls='', color='gray', ms=8,
+                 markeredgewidth=2, label='predicted')
 
     ax1.axvline(x=unique_M, color='gray', ls=':', alpha=0.5,
                 label=f'unique data ({unique_M:.0f}M)')
@@ -163,17 +225,23 @@ def plot_scaling_pair(df, title_suffix, output_path, unique_samples):
                  va='bottom', bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'))
 
     # ---- Right: Loss vs Model Size ----
-    for i, d_val in enumerate(budget_vals):
+    for d_val in all_d_vals:
         sub = df[df['D_M'] == d_val].sort_values('params_M')
-        if sub.empty:
-            continue
-        c = budget_cmap[i % len(budget_cmap)]
+        c = budget_cmap[d_val]
         is_reused = d_val * 1e6 > unique_samples
         label = f"D={d_val:.1f}M" + (" (reused)" if is_reused else "")
-        ax2.plot(sub['params_M'], sub['train_loss'],
-                 marker='s', ls='', color=c, label=label, ms=7,
-                 markerfacecolor='none' if is_reused else c,
-                 markeredgewidth=1.5 if is_reused else 1.0)
+        if not sub.empty:
+            ax2.plot(sub['params_M'], sub['train_loss'],
+                     marker='s', ls='', color=c, label=label, ms=7,
+                     markerfacecolor='none' if is_reused else c,
+                     markeredgewidth=1.5 if is_reused else 1.0)
+
+        if pred_df is not None and not pred_df.empty:
+            psub = pred_df[pred_df['D_M'] == d_val].sort_values('params_M')
+            if not psub.empty:
+                ax2.plot(psub['params_M'], psub['train_loss'],
+                         marker='x', ls='', color=c, ms=8, markeredgewidth=2, alpha=0.7,
+                         label=label + ' (pred)' if sub.empty else None)
 
         if popt is not None:
             x_fit = np.logspace(np.log10(0.05), np.log10(30.0), 50)
@@ -247,6 +315,10 @@ def main():
                         help='Select specific epoch (0-indexed). Default: best loss across all epochs.')
     parser.add_argument('--filter', nargs='+', default=None,
                         help='Filter: key=value pairs (e.g., sample_type=Pythia)')
+    parser.add_argument('--predict', action='store_true',
+                        help='Predict missing runs from fitted scaling law')
+    parser.add_argument('--complete-only', action='store_true',
+                        help='Exclude incomplete runs (max epoch < num_epochs_cfg - 1)')
     parser.add_argument('--output-dir', default=DEFAULT_OUTPUT_DIR, help='Output directory for plots')
     args = parser.parse_args()
 
@@ -268,6 +340,20 @@ def main():
     if df.empty:
         print("No data after filtering.")
         return
+
+    # Exclude incomplete runs if requested
+    if args.complete_only:
+        group_keys = ['model_size', 'data_budget', 'sample_type', 'feature_type', 'pair_tag']
+        complete_mask = df.groupby(group_keys).apply(
+            lambda g: g['epoch'].max() >= g['num_epochs_cfg'].iloc[0] - 1
+        )
+        complete_keys = complete_mask[complete_mask].index
+        before = df[group_keys].drop_duplicates().shape[0]
+        df = df.merge(
+            pd.DataFrame(complete_keys.tolist(), columns=group_keys),
+            on=group_keys, how='inner')
+        after = df[group_keys].drop_duplicates().shape[0]
+        print(f"  --complete-only: {before} -> {after} runs ({before - after} incomplete excluded)")
 
     # Select epoch
     epoch_tag = f'_epoch{args.epoch}' if args.epoch is not None else '_best'
@@ -297,7 +383,23 @@ def main():
         output_path = os.path.join(args.output_dir, f'scaling_{safe_name}.png')
 
         print(f"\n--- {config_label} ({len(group)} points) ---")
-        popt, r2 = plot_scaling_pair(group, config_label, output_path, unique)
+
+        # Generate predictions if requested
+        pred_df = None
+        if args.predict:
+            safe_name += '_pred'
+            output_path = os.path.join(args.output_dir, f'scaling_{safe_name}.png')
+            N = group['params_M'].values
+            D = group['D_M'].values
+            L = group['train_loss'].values
+            popt_pre, _ = fit_chinchilla(N, D, L)
+            pred_df = make_predictions(popt_pre, group, epoch=args.epoch)
+            if not pred_df.empty:
+                print(f"  Predictions for {len(pred_df)} missing (model, budget) combos:")
+                print(pred_df[['model_size', 'data_budget', 'params_M', 'D_M', 'train_loss']]
+                      .sort_values(['D_M', 'params_M']).to_string(index=False))
+
+        popt, r2 = plot_scaling_pair(group, config_label, output_path, unique, pred_df=pred_df)
 
         if popt is not None:
             fits[config_label] = {'popt': popt, 'r2': r2}
