@@ -136,3 +136,14 @@ weaver-core
 
 # run dir
 runs
+
+*plots*
+CLAUDE*
+.claude*
+.codex*
+*pdf
+
+# Node / npm
+node_modules/
+package.json
+package-lock.json

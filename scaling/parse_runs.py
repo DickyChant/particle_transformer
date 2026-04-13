@@ -45,16 +45,88 @@ BUDGET_EPOCH_CONFIG = {
 DEFAULT_NGPUS = 4
 
 TRAIN_LOSS_RE = re.compile(r'Train AvgLoss: ([\d.]+)')
+TRAIN_ACC_RE = re.compile(r'Train AvgLoss: [\d.]+, AvgAcc: ([\d.]+)')
+VAL_METRIC_RE = re.compile(r'Current validation metric: ([\d.]+)')
+ROC_AUC_RE = re.compile(r'^\s*- roc_auc_score:\s*$')
+ROC_AUC_VAL_RE = re.compile(r'^([\d.]+)\s*$')
 
 CSV_COLUMNS = [
     'model_size', 'data_budget', 'sample_type', 'feature_type', 'pair_tag',
-    'params_M', 'num_epochs_cfg', 'epoch', 'samples_per_epoch', 'ngpus',
-    'total_samples_seen', 'train_loss', 'source', 'run_dir',
+    'run_type', 'params_M', 'num_epochs_cfg', 'epoch', 'samples_per_epoch',
+    'ngpus', 'total_samples_seen', 'train_loss', 'train_acc',
+    'val_metric', 'val_roc_auc', 'source', 'run_dir',
 ]
 
 
+def _extract_metrics_from_log(filepath):
+    """Extract per-epoch metrics from a weaver log file.
+
+    Returns list of dicts with keys: train_loss, train_acc, val_metric, val_roc_auc.
+    Each entry corresponds to one epoch (in order).
+    """
+    epochs = []
+    current = {}
+    try:
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Train loss + accuracy
+            m_loss = TRAIN_LOSS_RE.search(line)
+            if m_loss:
+                current['train_loss'] = float(m_loss.group(1))
+                m_acc = TRAIN_ACC_RE.search(line)
+                if m_acc:
+                    current['train_acc'] = float(m_acc.group(1))
+
+            # Validation metric (AUC from weaver)
+            m_val = VAL_METRIC_RE.search(line)
+            if m_val:
+                current['val_metric'] = float(m_val.group(1))
+
+            # roc_auc_score (standalone, next line has the value)
+            # Weaver logs two roc_auc_score blocks per epoch: train first, then val.
+            # We want the second (validation) one.
+            if ROC_AUC_RE.match(line) and 'matrix' not in line:
+                if i + 1 < len(lines):
+                    m_roc = ROC_AUC_VAL_RE.match(lines[i + 1].strip())
+                    if m_roc:
+                        roc_val = float(m_roc.group(1))
+                        if '_roc_train' not in current:
+                            current['_roc_train'] = roc_val
+                        else:
+                            # Second occurrence = validation ROC
+                            current['val_roc_auc'] = roc_val
+
+            # Epoch boundary: when we see "Epoch #N training" and we have data
+            if 'Epoch #' in line and 'training' in line and current.get('train_loss') is not None:
+                epochs.append({
+                    'train_loss': current.get('train_loss'),
+                    'train_acc': current.get('train_acc'),
+                    'val_metric': current.get('val_metric'),
+                    'val_roc_auc': current.get('val_roc_auc'),
+                })
+                current = {}
+
+            i += 1
+
+        # Don't forget last epoch
+        if current.get('train_loss') is not None:
+            epochs.append({
+                'train_loss': current.get('train_loss'),
+                'train_acc': current.get('train_acc'),
+                'val_metric': current.get('val_metric'),
+                'val_roc_auc': current.get('val_roc_auc'),
+            })
+    except Exception:
+        pass
+    return epochs
+
+
 def _extract_losses_from_log(filepath):
-    """Extract ordered list of Train AvgLoss values from a weaver log file."""
+    """Extract ordered list of Train AvgLoss values from a weaver log file (legacy)."""
     losses = []
     try:
         with open(filepath, 'r') as f:
@@ -99,6 +171,7 @@ def parse_v2_runs(results_dir):
         spe = int(config.get('samples_per_epoch', 0))
         ngpus = int(config.get('ngpus', DEFAULT_NGPUS))
         num_epochs_cfg = int(config.get('num_epochs', 0))
+        run_type = '1ep' if '_1ep_' in run_dir_name else 'multi'
 
         if spe == 0:
             # Fallback to defaults
@@ -109,26 +182,30 @@ def parse_v2_runs(results_dir):
 
         # Find the log with the most epoch data
         log_files = sorted(glob.glob(os.path.join(run_dir, 'logs', '*.log.000')))
-        best_losses = []
+        best_metrics = []
         for lf in log_files:
-            losses = _extract_losses_from_log(lf)
-            if len(losses) > len(best_losses):
-                best_losses = losses
+            metrics = _extract_metrics_from_log(lf)
+            if len(metrics) > len(best_metrics):
+                best_metrics = metrics
 
-        for epoch_idx, loss in enumerate(best_losses):
+        for epoch_idx, m in enumerate(best_metrics):
             rows.append({
                 'model_size': model,
                 'data_budget': budget,
                 'sample_type': sample_type,
                 'feature_type': feature_type,
                 'pair_tag': pair_tag,
+                'run_type': run_type,
                 'params_M': PARAMS_M.get(model, 0),
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
                 'samples_per_epoch': spe,
                 'ngpus': ngpus,
                 'total_samples_seen': spe * ngpus * (epoch_idx + 1),
-                'train_loss': loss,
+                'train_loss': m['train_loss'],
+                'train_acc': m.get('train_acc'),
+                'val_metric': m.get('val_metric'),
+                'val_roc_auc': m.get('val_roc_auc'),
                 'source': 'v2_run_dir',
                 'run_dir': run_dir,
             })
@@ -160,28 +237,32 @@ def parse_v1_logs(results_dir):
         spe, num_epochs_cfg = BUDGET_EPOCH_CONFIG[budget]
 
         # Use the file with the most epoch data (latest complete run)
-        best_losses = []
+        best_metrics = []
         best_file = None
         for lf in files:
-            losses = _extract_losses_from_log(lf)
-            if len(losses) > len(best_losses):
-                best_losses = losses
+            metrics = _extract_metrics_from_log(lf)
+            if len(metrics) > len(best_metrics):
+                best_metrics = metrics
                 best_file = lf
 
-        for epoch_idx, loss in enumerate(best_losses):
+        for epoch_idx, met in enumerate(best_metrics):
             rows.append({
                 'model_size': model,
                 'data_budget': budget,
                 'sample_type': 'Pythia',
                 'feature_type': 'full',
                 'pair_tag': 'pair',
+                'run_type': 'multi',
                 'params_M': PARAMS_M.get(model, 0),
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
                 'samples_per_epoch': spe,
                 'ngpus': DEFAULT_NGPUS,
                 'total_samples_seen': spe * DEFAULT_NGPUS * (epoch_idx + 1),
-                'train_loss': loss,
+                'train_loss': met['train_loss'],
+                'train_acc': met.get('train_acc'),
+                'val_metric': met.get('val_metric'),
+                'val_roc_auc': met.get('val_roc_auc'),
                 'source': 'v1_log',
                 'run_dir': os.path.dirname(best_file) if best_file else '',
             })
@@ -233,6 +314,7 @@ def parse_v1_slurm(results_dir):
                 'sample_type': 'Pythia',
                 'feature_type': 'full',
                 'pair_tag': 'pair',
+                'run_type': 'multi',
                 'params_M': PARAMS_M.get(model, 0),
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
@@ -240,6 +322,9 @@ def parse_v1_slurm(results_dir):
                 'ngpus': DEFAULT_NGPUS,
                 'total_samples_seen': spe * DEFAULT_NGPUS * (epoch_idx + 1),
                 'train_loss': loss,
+                'train_acc': None,
+                'val_metric': None,
+                'val_roc_auc': None,
                 'source': 'v1_slurm',
                 'run_dir': sf,
             })
@@ -248,16 +333,17 @@ def parse_v1_slurm(results_dir):
 
 
 def deduplicate(rows):
-    """Keep the row with the lowest loss for each (model, budget, config, epoch)."""
+    """Keep the row with the lowest loss for each (model, budget, config, run_type, epoch)."""
     best = {}
     for r in rows:
         key = (r['model_size'], r['data_budget'], r['sample_type'],
-               r['feature_type'], r['pair_tag'], r['epoch'])
+               r['feature_type'], r['pair_tag'], r['run_type'], r['epoch'])
         if key not in best or r['train_loss'] < best[key]['train_loss']:
             best[key] = r
     return sorted(best.values(),
-                  key=lambda r: (r['sample_type'], r['feature_type'], r['pair_tag'],
-                                 r['model_size'], r['data_budget'], r['epoch']))
+                  key=lambda r: (r['run_type'], r['sample_type'], r['feature_type'],
+                                 r['pair_tag'], r['model_size'], r['data_budget'],
+                                 r['epoch']))
 
 
 def main():
