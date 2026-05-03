@@ -19,10 +19,11 @@ import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import Counter
+from collections import Counter, defaultdict
 
 from weaver.nn.model.ParticleTransformer import ParticleTransformer
 from weaver.utils.logger import _logger
+from weaver.utils.data.tools import _concat
 
 
 # ---- Model ----
@@ -282,9 +283,13 @@ def _make_evaluate_fn():
         entry_count = 0
 
         scores = []
-        labels_cls = []
-        preds_reg = []
-        targets_reg = []
+        # Match weaver's standard contract: labels and observers are dicts
+        # keyed by the YAML field names. We always accumulate `y` (so loss
+        # computation has cls_label / reg_target); observers are only needed
+        # in test/predict mode where we write a ROOT/parquet file.
+        labels = defaultdict(list)
+        observers = defaultdict(list)
+        preds_reg = []  # also kept separately for sklearn regression metrics
 
         start_time = time.time()
         with torch.no_grad():
@@ -312,9 +317,12 @@ def _make_evaluate_fn():
                     num_batches += 1
 
                     scores.append(torch.softmax(cls_logits.float(), dim=1).cpu().numpy())
-                    labels_cls.append(cls_label.cpu().numpy())
+                    for k, v in y.items():
+                        labels[k].append(v.cpu().numpy())
                     preds_reg.append(reg_pred.cpu().numpy())
-                    targets_reg.append(reg_target.cpu().numpy())
+                    if not for_training and Z is not None:
+                        for k, v in Z.items():
+                            observers[k].append(v)
 
                     if steps_per_epoch is not None and num_batches >= steps_per_epoch:
                         break
@@ -326,13 +334,18 @@ def _make_evaluate_fn():
         avg_acc = total_correct / count if count > 0 else 0
 
         scores = np.concatenate(scores)
-        labels_cls = np.concatenate(labels_cls)
+        labels = {k: _concat(v) for k, v in labels.items()}
         preds_reg = np.concatenate(preds_reg)
-        targets_reg = np.concatenate(targets_reg)
+        # Stash regression predictions alongside labels so they are written
+        # to the predict-output ROOT/parquet file like any other column.
+        labels['reg_pred'] = preds_reg
+        observers = {k: _concat(v) for k, v in observers.items()}
+
+        labels_cls = labels['cls_label']
+        targets_reg = labels['reg_target']
 
         # Classification metrics
         from weaver.utils.nn.metrics import evaluate_metrics
-        eval_kw = {'score': scores, 'label': labels_cls}
         metric_results = evaluate_metrics(labels_cls, scores, eval_metrics=eval_metrics)
 
         # Regression metrics
@@ -369,8 +382,10 @@ def _make_evaluate_fn():
                 ])
             return val_metric
         else:
-            # Test mode: weaver expects (metric, scores, labels, observers)
-            return val_metric, scores, labels_cls, None
+            # Test mode: weaver expects (metric, scores, labels_dict, observers_dict).
+            # save_root/save_parquet then call output.update(labels) and
+            # output.update(observers); both must be plain dicts of arrays.
+            return val_metric, scores, labels, observers
 
     return evaluate_multitask
 

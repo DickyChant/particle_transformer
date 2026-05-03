@@ -42,6 +42,8 @@ def fit_form(form, N, D, L, p0, bounds):
 
 def select(df):
     keys = ['model_size', 'data_budget', 'sample_type', 'feature_type', 'pair_tag', 'run_type']
+    if 'task_type' in df.columns:
+        keys.append('task_type')
     return df.dropna(subset=['train_loss']).sort_values('train_loss').drop_duplicates(subset=keys, keep='first').copy()
 
 

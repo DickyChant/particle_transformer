@@ -88,6 +88,8 @@ def fit_form(form_func, N, D, L, p0, bounds, E_fixed=None):
 def select_best(df, metric='train_loss'):
     keys = ['model_size', 'data_budget', 'sample_type', 'feature_type',
             'pair_tag', 'run_type']
+    if 'task_type' in df.columns:
+        keys.append('task_type')
     df = df.dropna(subset=[metric])
     return df.sort_values(metric).drop_duplicates(subset=keys, keep='first').copy()
 

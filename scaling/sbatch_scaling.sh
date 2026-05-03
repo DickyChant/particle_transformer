@@ -293,6 +293,7 @@ total_samples: $TOTAL_SAMPLES
 unique_samples: $UNIQUE_SAMPLES
 data_reuse: $DATA_REUSE
 ngpus: $NGPUS
+task_type: singletask
 EOF
 
 # ---- DDP Command ----

@@ -66,6 +66,8 @@ def fit_with_cov(form, N, D, L, p0, bounds):
 def select_best(df, metric='train_loss'):
     keys = ['model_size', 'data_budget', 'sample_type', 'feature_type',
             'pair_tag', 'run_type']
+    if 'task_type' in df.columns:
+        keys.append('task_type')
     df = df.dropna(subset=[metric])
     return df.sort_values(metric).drop_duplicates(subset=keys, keep='first').copy()
 

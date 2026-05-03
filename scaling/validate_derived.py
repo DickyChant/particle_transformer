@@ -94,6 +94,8 @@ def select_best(df, metric):
     Then drop rows where the metric is missing."""
     keys = ['model_size', 'data_budget', 'sample_type', 'feature_type',
             'pair_tag', 'run_type']
+    if 'task_type' in df.columns:
+        keys.append('task_type')
     df = df.dropna(subset=['train_loss'])
     df = df.sort_values('train_loss').drop_duplicates(subset=keys, keep='first')
     df = df.dropna(subset=[metric]).copy()

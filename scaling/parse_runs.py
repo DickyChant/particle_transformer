@@ -50,18 +50,57 @@ VAL_METRIC_RE = re.compile(r'Current validation metric: ([\d.]+)')
 ROC_AUC_RE = re.compile(r'^\s*- roc_auc_score:\s*$')
 ROC_AUC_VAL_RE = re.compile(r'^([\d.]+)\s*$')
 
+# Weaver logs e.g. "Number of parameters:           2.14 M" — capture value+unit.
+PARAMS_LOG_RE = re.compile(r'Number of parameters:\s+([\d.]+)\s*([kMG]?)')
+
+# Multitask-specific per-task losses logged by networks/multitask_ParT.py.
+# Real weaver logs prefix every line with `[YYYY-MM-DD HH:MM:SS,ms] INFO:`,
+# so we use unanchored patterns and re.search() throughout. The `(w=...)`
+# clause distinguishes the train line ("CE: x (w=y), MSE: ..., GradCos: ...")
+# from the eval line ("CE: x, MSE: y") so the same regex doesn't match both.
+TRAIN_CE_RE = re.compile(r'CE:\s*([\d.]+)\s*\(w=([\d.]+)\)')
+TRAIN_MSE_RE = re.compile(r'MSE:\s*([\d.]+)\s*\(w=([\d.]+)\)')
+TRAIN_GRADCOS_RE = re.compile(r'GradCos:\s*([-\d.eE+]+|nan)')
+EVAL_REG_MAE_RE = re.compile(r'Regression MSE:\s*[\d.]+,\s*MAE:\s*([\d.]+)')
+
 CSV_COLUMNS = [
     'model_size', 'data_budget', 'sample_type', 'feature_type', 'pair_tag',
-    'run_type', 'params_M', 'num_epochs_cfg', 'epoch', 'samples_per_epoch',
-    'ngpus', 'total_samples_seen', 'train_loss', 'train_acc',
-    'val_metric', 'val_roc_auc', 'source', 'run_dir',
+    'run_type', 'task_type', 'params_M', 'num_epochs_cfg', 'epoch',
+    'samples_per_epoch', 'ngpus', 'total_samples_seen',
+    'train_loss', 'train_acc', 'val_metric', 'val_roc_auc',
+    'train_ce', 'train_mse', 'train_grad_cos', 'val_reg_mae',
+    'source', 'run_dir',
 ]
+
+
+def _params_M_from_log(log_path):
+    """Extract the actual model parameter count (in M) from a weaver log.
+    Returns None if not found.
+    """
+    try:
+        with open(log_path, 'r') as f:
+            for line in f:
+                m = PARAMS_LOG_RE.search(line)
+                if m:
+                    val = float(m.group(1))
+                    unit = m.group(2)
+                    if unit == 'k':
+                        return val / 1000.0
+                    if unit == 'M':
+                        return val
+                    if unit == 'G':
+                        return val * 1000.0
+                    return val / 1e6
+    except Exception:
+        pass
+    return None
 
 
 def _extract_metrics_from_log(filepath):
     """Extract per-epoch metrics from a weaver log file.
 
-    Returns list of dicts with keys: train_loss, train_acc, val_metric, val_roc_auc.
+    Returns list of dicts with keys: train_loss, train_acc, val_metric, val_roc_auc,
+    plus multitask-only fields train_ce, train_mse, train_grad_cos, val_reg_mae.
     Each entry corresponds to one epoch (in order).
     """
     epochs = []
@@ -86,6 +125,26 @@ def _extract_metrics_from_log(filepath):
             if m_val:
                 current['val_metric'] = float(m_val.group(1))
 
+            # Multitask training: "[ts] INFO:   CE: x (w=y), MSE: x (w=y), GradCos: ..."
+            m_ce_train = TRAIN_CE_RE.search(line)
+            if m_ce_train:
+                current['train_ce'] = float(m_ce_train.group(1))
+                m_mse_train = TRAIN_MSE_RE.search(line)
+                if m_mse_train:
+                    current['train_mse'] = float(m_mse_train.group(1))
+                m_gc = TRAIN_GRADCOS_RE.search(line)
+                if m_gc:
+                    try:
+                        current['train_grad_cos'] = float(m_gc.group(1))
+                    except ValueError:
+                        # GradCos: nan early in training (no shared grads yet)
+                        current['train_grad_cos'] = float('nan')
+
+            # Multitask validation regression: "  Regression MSE: ..., MAE: ..."
+            m_reg_eval = EVAL_REG_MAE_RE.search(line)
+            if m_reg_eval:
+                current['val_reg_mae'] = float(m_reg_eval.group(1))
+
             # roc_auc_score (standalone, next line has the value)
             # Weaver logs two roc_auc_score blocks per epoch: train first, then val.
             # We want the second (validation) one.
@@ -107,6 +166,10 @@ def _extract_metrics_from_log(filepath):
                     'train_acc': current.get('train_acc'),
                     'val_metric': current.get('val_metric'),
                     'val_roc_auc': current.get('val_roc_auc'),
+                    'train_ce': current.get('train_ce'),
+                    'train_mse': current.get('train_mse'),
+                    'train_grad_cos': current.get('train_grad_cos'),
+                    'val_reg_mae': current.get('val_reg_mae'),
                 })
                 current = {}
 
@@ -119,6 +182,10 @@ def _extract_metrics_from_log(filepath):
                 'train_acc': current.get('train_acc'),
                 'val_metric': current.get('val_metric'),
                 'val_roc_auc': current.get('val_roc_auc'),
+                'train_ce': current.get('train_ce'),
+                'train_mse': current.get('train_mse'),
+                'train_grad_cos': current.get('train_grad_cos'),
+                'val_reg_mae': current.get('val_reg_mae'),
             })
     except Exception:
         pass
@@ -168,6 +235,9 @@ def parse_v2_runs(results_dir):
         sample_type = config.get('sample_type', 'Pythia')
         feature_type = config.get('feature_type', 'full')
         pair_tag = config.get('pair_tag', 'pair')
+        # Single-task launchers and the multitask launcher both write task_type;
+        # default to 'singletask' for legacy v2 runs that pre-date the field.
+        task_type = config.get('task_type', 'singletask')
         spe = int(config.get('samples_per_epoch', 0))
         ngpus = int(config.get('ngpus', DEFAULT_NGPUS))
         num_epochs_cfg = int(config.get('num_epochs', 0))
@@ -183,10 +253,17 @@ def parse_v2_runs(results_dir):
         # Find the log with the most epoch data
         log_files = sorted(glob.glob(os.path.join(run_dir, 'logs', '*.log.000')))
         best_metrics = []
+        best_log = None
         for lf in log_files:
             metrics = _extract_metrics_from_log(lf)
             if len(metrics) > len(best_metrics):
                 best_metrics = metrics
+                best_log = lf
+
+        # Prefer the param count weaver actually logged. Falls back to the
+        # single-task name lookup for legacy/early runs that don't have it.
+        params_from_log = _params_M_from_log(best_log) if best_log else None
+        params_M_value = params_from_log if params_from_log is not None else PARAMS_M.get(model, 0)
 
         for epoch_idx, m in enumerate(best_metrics):
             rows.append({
@@ -196,7 +273,8 @@ def parse_v2_runs(results_dir):
                 'feature_type': feature_type,
                 'pair_tag': pair_tag,
                 'run_type': run_type,
-                'params_M': PARAMS_M.get(model, 0),
+                'task_type': task_type,
+                'params_M': params_M_value,
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
                 'samples_per_epoch': spe,
@@ -206,6 +284,10 @@ def parse_v2_runs(results_dir):
                 'train_acc': m.get('train_acc'),
                 'val_metric': m.get('val_metric'),
                 'val_roc_auc': m.get('val_roc_auc'),
+                'train_ce': m.get('train_ce'),
+                'train_mse': m.get('train_mse'),
+                'train_grad_cos': m.get('train_grad_cos'),
+                'val_reg_mae': m.get('val_reg_mae'),
                 'source': 'v2_run_dir',
                 'run_dir': run_dir,
             })
@@ -245,6 +327,9 @@ def parse_v1_logs(results_dir):
                 best_metrics = metrics
                 best_file = lf
 
+        params_from_log = _params_M_from_log(best_file) if best_file else None
+        params_M_value = params_from_log if params_from_log is not None else PARAMS_M.get(model, 0)
+
         for epoch_idx, met in enumerate(best_metrics):
             rows.append({
                 'model_size': model,
@@ -253,7 +338,8 @@ def parse_v1_logs(results_dir):
                 'feature_type': 'full',
                 'pair_tag': 'pair',
                 'run_type': 'multi',
-                'params_M': PARAMS_M.get(model, 0),
+                'task_type': 'singletask',
+                'params_M': params_M_value,
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
                 'samples_per_epoch': spe,
@@ -263,6 +349,8 @@ def parse_v1_logs(results_dir):
                 'train_acc': met.get('train_acc'),
                 'val_metric': met.get('val_metric'),
                 'val_roc_auc': met.get('val_roc_auc'),
+                'train_ce': None, 'train_mse': None,
+                'train_grad_cos': None, 'val_reg_mae': None,
                 'source': 'v1_log',
                 'run_dir': os.path.dirname(best_file) if best_file else '',
             })
@@ -315,6 +403,7 @@ def parse_v1_slurm(results_dir):
                 'feature_type': 'full',
                 'pair_tag': 'pair',
                 'run_type': 'multi',
+                'task_type': 'singletask',
                 'params_M': PARAMS_M.get(model, 0),
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
@@ -325,6 +414,8 @@ def parse_v1_slurm(results_dir):
                 'train_acc': None,
                 'val_metric': None,
                 'val_roc_auc': None,
+                'train_ce': None, 'train_mse': None,
+                'train_grad_cos': None, 'val_reg_mae': None,
                 'source': 'v1_slurm',
                 'run_dir': sf,
             })
@@ -333,17 +424,23 @@ def parse_v1_slurm(results_dir):
 
 
 def deduplicate(rows):
-    """Keep the row with the lowest loss for each (model, budget, config, run_type, epoch)."""
+    """Keep the row with the lowest loss for each unique config × epoch.
+
+    `task_type` is part of the key so single-task and multitask runs that share
+    a `model_size` name (but have different architectures and parameter counts)
+    cannot accidentally dedup against each other.
+    """
     best = {}
     for r in rows:
         key = (r['model_size'], r['data_budget'], r['sample_type'],
-               r['feature_type'], r['pair_tag'], r['run_type'], r['epoch'])
+               r['feature_type'], r['pair_tag'], r['run_type'],
+               r.get('task_type', 'singletask'), r['epoch'])
         if key not in best or r['train_loss'] < best[key]['train_loss']:
             best[key] = r
     return sorted(best.values(),
                   key=lambda r: (r['run_type'], r['sample_type'], r['feature_type'],
-                                 r['pair_tag'], r['model_size'], r['data_budget'],
-                                 r['epoch']))
+                                 r['pair_tag'], r.get('task_type', 'singletask'),
+                                 r['model_size'], r['data_budget'], r['epoch']))
 
 
 def main():
