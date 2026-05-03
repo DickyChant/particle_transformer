@@ -211,6 +211,27 @@ EOF
 
 echo "Model: $MODEL_SIZE (multitask), Budget: $DATA_BUDGET, Epochs: $num_epochs"
 
+# ---- Resume support ----
+RESUME_ARGS=()
+LAST_EPOCH=""
+if ls "$RUN_DIR/checkpoints"/net_epoch-*_state.pt 1> /dev/null 2>&1; then
+    for ckpt in "$RUN_DIR/checkpoints"/net_epoch-*_state.pt; do
+        n=$(basename "$ckpt" | sed -E 's/^net_epoch-([0-9]+)_state\.pt$/\1/')
+        opt="$RUN_DIR/checkpoints/net_epoch-${n}_optimizer.pt"
+        if [ -f "$opt" ]; then
+            if [ -z "$LAST_EPOCH" ] || [ "$n" -gt "$LAST_EPOCH" ]; then
+                LAST_EPOCH=$n
+            fi
+        fi
+    done
+fi
+if [ -n "$LAST_EPOCH" ]; then
+    echo "Resuming from epoch $LAST_EPOCH (will continue at epoch $((LAST_EPOCH + 1)))"
+    RESUME_ARGS=(--load-epoch "$LAST_EPOCH")
+else
+    echo "No usable checkpoint found; starting from scratch"
+fi
+
 # ---- DDP Command ----
 if ((NGPUS > 1)); then
     CMD="torchrun --standalone --nnodes=1 --nproc_per_node=$NGPUS -- $(which weaver) --backend nccl"
@@ -238,6 +259,8 @@ $CMD \
     --log "$RUN_DIR/logs/{auto}.log" \
     --predict-output pred.root \
     --tensorboard "$RUN_DIR/tensorboard" \
+    --save-steps "${SAVE_STEPS:-200}" \
+    "${RESUME_ARGS[@]}" \
     "${@:3}"
 
 TRAIN_EXIT_CODE=$?

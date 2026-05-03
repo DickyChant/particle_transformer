@@ -141,8 +141,26 @@ echo "Run: $RUN_NAME"
 echo "Run dir: $RUN_DIR"
 
 # ---- Check for existing checkpoints (resume support) ----
-if ls "$RUN_DIR/checkpoints"/*.pt 1> /dev/null 2>&1; then
-    echo "Found existing checkpoints"
+# weaver expects --load-epoch N to load ${MODEL_PREFIX}_epoch-N_state.pt and resume from epoch N+1.
+# Pick the highest N for which BOTH state and optimizer checkpoints exist (so optimizer state survives).
+RESUME_ARGS=()
+LAST_EPOCH=""
+if ls "$RUN_DIR/checkpoints"/net_epoch-*_state.pt 1> /dev/null 2>&1; then
+    for ckpt in "$RUN_DIR/checkpoints"/net_epoch-*_state.pt; do
+        n=$(basename "$ckpt" | sed -E 's/^net_epoch-([0-9]+)_state\.pt$/\1/')
+        opt="$RUN_DIR/checkpoints/net_epoch-${n}_optimizer.pt"
+        if [ -f "$opt" ]; then
+            if [ -z "$LAST_EPOCH" ] || [ "$n" -gt "$LAST_EPOCH" ]; then
+                LAST_EPOCH=$n
+            fi
+        fi
+    done
+fi
+if [ -n "$LAST_EPOCH" ]; then
+    echo "Resuming from epoch $LAST_EPOCH (will continue at epoch $((LAST_EPOCH + 1)))"
+    RESUME_ARGS=(--load-epoch "$LAST_EPOCH")
+else
+    echo "No usable checkpoint found; starting from scratch"
 fi
 
 # ---- Requeue Handler ----
@@ -320,6 +338,8 @@ $CMD \
     --log "$RUN_DIR/logs/{auto}.log" \
     --predict-output pred.root \
     --tensorboard "$RUN_DIR/tensorboard" \
+    --save-steps "${SAVE_STEPS:-200}" \
+    "${RESUME_ARGS[@]}" \
     "${@:3}"
 
 TRAIN_EXIT_CODE=$?
