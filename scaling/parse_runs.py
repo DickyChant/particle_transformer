@@ -28,8 +28,8 @@ RESULTS_DIR_V2 = '/pscratch/sd/s/sqian/part_training_output/scaling_study_v2'
 DEFAULT_OUTPUT = os.path.join(RESULTS_DIR_V2, 'parsed_runs.csv')
 
 PARAMS_M = {
-    'nano': 0.1, 'micro': 0.2, 'tiny': 0.4,
-    'small': 1.0, 'base': 2.14, 'large': 8.5, 'xlarge': 25.0,
+    'nano': 0.0497, 'micro': 0.1375, 'tiny': 0.2919,
+    'small': 0.9871, 'base': 2.140, 'large': 11.670, 'xlarge': 35.070,
 }
 
 # Default epoch config for v1 runs: (samples_per_epoch_per_gpu, num_epochs)
@@ -50,9 +50,6 @@ VAL_METRIC_RE = re.compile(r'Current validation metric: ([\d.]+)')
 ROC_AUC_RE = re.compile(r'^\s*- roc_auc_score:\s*$')
 ROC_AUC_VAL_RE = re.compile(r'^([\d.]+)\s*$')
 
-# Weaver logs e.g. "Number of parameters:           2.14 M" — capture value+unit.
-PARAMS_LOG_RE = re.compile(r'Number of parameters:\s+([\d.]+)\s*([kMG]?)')
-
 # Multitask-specific per-task losses logged by networks/multitask_ParT.py.
 # Real weaver logs prefix every line with `[YYYY-MM-DD HH:MM:SS,ms] INFO:`,
 # so we use unanchored patterns and re.search() throughout. The `(w=...)`
@@ -68,32 +65,53 @@ CSV_COLUMNS = [
     'run_type', 'task_type', 'params_M', 'num_epochs_cfg', 'epoch',
     'samples_per_epoch', 'ngpus', 'total_samples_seen',
     'train_loss', 'train_acc', 'val_metric', 'val_roc_auc',
+    'test_metric', 'test_roc_auc',
     'train_ce', 'train_mse', 'train_grad_cos', 'val_reg_mae',
     'source', 'run_dir',
 ]
 
+# Weaver logs `Test metric X.XXXXX` once at the end of a run with `--data-test`.
+# By default this is test accuracy (the eval function returns total_correct/count).
+# Test ROC AUC comes from the LAST `roc_auc_score:` block in the log.
+TEST_METRIC_RE = re.compile(r'Test metric\s+([\d.]+)')
 
-def _params_M_from_log(log_path):
-    """Extract the actual model parameter count (in M) from a weaver log.
-    Returns None if not found.
+
+def _extract_test_metrics_from_log(filepath):
+    """Extract end-of-run test-set metrics from a weaver log.
+
+    Returns dict with `test_metric` (Test metric line; usually accuracy) and
+    `test_roc_auc` (the LAST `roc_auc_score:` block in the log, which is the
+    test-eval ROC AUC since test is run after all training/validation epochs).
+    Either may be None if the run didn't reach the test phase.
     """
+    out = {'test_metric': None, 'test_roc_auc': None}
     try:
-        with open(log_path, 'r') as f:
-            for line in f:
-                m = PARAMS_LOG_RE.search(line)
-                if m:
-                    val = float(m.group(1))
-                    unit = m.group(2)
-                    if unit == 'k':
-                        return val / 1000.0
-                    if unit == 'M':
-                        return val
-                    if unit == 'G':
-                        return val * 1000.0
-                    return val / 1e6
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
     except Exception:
-        pass
-    return None
+        return out
+
+    # Test accuracy: parse "Test metric X.XXXXX"
+    for line in lines:
+        m = TEST_METRIC_RE.search(line)
+        if m:
+            out['test_metric'] = float(m.group(1))
+            # don't break — keep the LAST occurrence in case multiple test
+            # phases are present (e.g. requeued runs)
+
+    # Test ROC AUC: only meaningful if the test phase actually ran (i.e., we
+    # saw a "Test metric" line). The last roc_auc_score block in the log
+    # is then the test-eval one, since weaver runs test after all epochs.
+    if out['test_metric'] is not None:
+        last_roc = None
+        for i, line in enumerate(lines):
+            if ROC_AUC_RE.match(line) and 'matrix' not in line:
+                if i + 1 < len(lines):
+                    m_roc = ROC_AUC_VAL_RE.match(lines[i + 1].strip())
+                    if m_roc:
+                        last_roc = float(m_roc.group(1))
+        out['test_roc_auc'] = last_roc
+    return out
 
 
 def _extract_metrics_from_log(filepath):
@@ -260,12 +278,13 @@ def parse_v2_runs(results_dir):
                 best_metrics = metrics
                 best_log = lf
 
-        # Prefer the param count weaver actually logged. Falls back to the
-        # single-task name lookup for legacy/early runs that don't have it.
-        params_from_log = _params_M_from_log(best_log) if best_log else None
-        params_M_value = params_from_log if params_from_log is not None else PARAMS_M.get(model, 0)
+        # Test-set metrics: one number per run, attach to the LAST epoch.
+        test_info = _extract_test_metrics_from_log(best_log) if best_log else \
+                    {'test_metric': None, 'test_roc_auc': None}
 
+        n_epochs = len(best_metrics)
         for epoch_idx, m in enumerate(best_metrics):
+            is_last = (epoch_idx == n_epochs - 1)
             rows.append({
                 'model_size': model,
                 'data_budget': budget,
@@ -274,7 +293,7 @@ def parse_v2_runs(results_dir):
                 'pair_tag': pair_tag,
                 'run_type': run_type,
                 'task_type': task_type,
-                'params_M': params_M_value,
+                'params_M': PARAMS_M.get(model, 0),
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
                 'samples_per_epoch': spe,
@@ -284,6 +303,8 @@ def parse_v2_runs(results_dir):
                 'train_acc': m.get('train_acc'),
                 'val_metric': m.get('val_metric'),
                 'val_roc_auc': m.get('val_roc_auc'),
+                'test_metric': test_info['test_metric'] if is_last else None,
+                'test_roc_auc': test_info['test_roc_auc'] if is_last else None,
                 'train_ce': m.get('train_ce'),
                 'train_mse': m.get('train_mse'),
                 'train_grad_cos': m.get('train_grad_cos'),
@@ -327,9 +348,9 @@ def parse_v1_logs(results_dir):
                 best_metrics = metrics
                 best_file = lf
 
-        params_from_log = _params_M_from_log(best_file) if best_file else None
-        params_M_value = params_from_log if params_from_log is not None else PARAMS_M.get(model, 0)
-
+        # v1 runs share a single flat `logs/` dir so we cannot uniquely associate
+        # a test result with one run. Skip test extraction for v1; only v2
+        # timestamped run dirs report test-set metrics.
         for epoch_idx, met in enumerate(best_metrics):
             rows.append({
                 'model_size': model,
@@ -339,7 +360,7 @@ def parse_v1_logs(results_dir):
                 'pair_tag': 'pair',
                 'run_type': 'multi',
                 'task_type': 'singletask',
-                'params_M': params_M_value,
+                'params_M': PARAMS_M.get(model, 0),
                 'num_epochs_cfg': num_epochs_cfg,
                 'epoch': epoch_idx,
                 'samples_per_epoch': spe,
@@ -349,6 +370,8 @@ def parse_v1_logs(results_dir):
                 'train_acc': met.get('train_acc'),
                 'val_metric': met.get('val_metric'),
                 'val_roc_auc': met.get('val_roc_auc'),
+                'test_metric': None,
+                'test_roc_auc': None,
                 'train_ce': None, 'train_mse': None,
                 'train_grad_cos': None, 'val_reg_mae': None,
                 'source': 'v1_log',
@@ -414,6 +437,8 @@ def parse_v1_slurm(results_dir):
                 'train_acc': None,
                 'val_metric': None,
                 'val_roc_auc': None,
+                'test_metric': None,
+                'test_roc_auc': None,
                 'train_ce': None, 'train_mse': None,
                 'train_grad_cos': None, 'val_reg_mae': None,
                 'source': 'v1_slurm',
