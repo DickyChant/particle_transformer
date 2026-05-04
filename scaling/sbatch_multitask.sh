@@ -240,6 +240,9 @@ else
 fi
 
 # ---- Launch Training ----
+# Disable -e around training so a non-zero exit reaches the requeue path
+# instead of killing the script under `set -e`.
+set +e
 $CMD \
     --data-train "${DATA_TRAIN_ARGS[@]}" \
     --data-val "${DATA_VAL_ARGS[@]}" \
@@ -262,8 +265,8 @@ $CMD \
     --save-steps "${SAVE_STEPS:-200}" \
     "${RESUME_ARGS[@]}" \
     "${@:3}"
-
 TRAIN_EXIT_CODE=$?
+set -e
 
 # ---- Post-training ----
 WEAVER_LOG=$(ls -t "$RUN_DIR"/logs/*.log.000 2>/dev/null | head -1)

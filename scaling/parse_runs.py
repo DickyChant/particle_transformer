@@ -140,21 +140,36 @@ def _extract_test_metrics_from_log(filepath):
     return out
 
 
+EPOCH_TRAIN_RE = re.compile(r'Epoch #(\d+) training')
+
+
 def _extract_metrics_from_log(filepath):
     """Extract per-epoch metrics from a weaver log file.
 
-    Returns list of dicts with keys: train_loss, train_acc, val_metric, val_roc_auc,
-    plus multitask-only fields train_ce, train_mse, train_grad_cos, val_reg_mae.
-    Each entry corresponds to one epoch (in order).
+    Returns list of dicts indexed by ABSOLUTE epoch number (recovered from
+    `Epoch #N training` lines), with keys: epoch, train_loss, train_acc,
+    val_metric, val_roc_auc, plus multitask-only fields train_ce, train_mse,
+    train_grad_cos, val_reg_mae. The list is sorted by epoch.
     """
-    epochs = []
+    by_epoch = {}
     current = {}
+    current_epoch = None
     try:
         with open(filepath, 'r') as f:
             lines = f.readlines()
         i = 0
         while i < len(lines):
             line = lines[i]
+
+            # Epoch start: capture the absolute epoch number that the next
+            # block of metrics belongs to.
+            m_epoch = EPOCH_TRAIN_RE.search(line)
+            if m_epoch:
+                # Flush any in-progress epoch dict before we move on.
+                if current_epoch is not None and current.get('train_loss') is not None:
+                    by_epoch[current_epoch] = current
+                current_epoch = int(m_epoch.group(1))
+                current = {}
 
             # Train loss + accuracy
             m_loss = TRAIN_LOSS_RE.search(line)
@@ -181,7 +196,6 @@ def _extract_metrics_from_log(filepath):
                     try:
                         current['train_grad_cos'] = float(m_gc.group(1))
                     except ValueError:
-                        # GradCos: nan early in training (no shared grads yet)
                         current['train_grad_cos'] = float('nan')
 
             # Multitask validation regression: "  Regression MSE: ..., MAE: ..."
@@ -190,46 +204,47 @@ def _extract_metrics_from_log(filepath):
                 current['val_reg_mae'] = float(m_reg_eval.group(1))
 
             # roc_auc_score (standalone, next line has the value).
-            # Weaver logs ONE roc_auc_score block per epoch (the validation eval).
-            # The end-of-run test roc_auc_score is captured separately by
-            # _extract_test_metrics_from_log so we can keep this strictly per-epoch.
             if ROC_AUC_RE.match(line) and 'matrix' not in line:
                 if i + 1 < len(lines):
                     m_roc = ROC_AUC_VAL_RE.match(lines[i + 1].strip())
                     if m_roc and current.get('val_roc_auc') is None:
                         current['val_roc_auc'] = float(m_roc.group(1))
 
-            # Epoch boundary: when we see "Epoch #N training" and we have data
-            if 'Epoch #' in line and 'training' in line and current.get('train_loss') is not None:
-                epochs.append({
-                    'train_loss': current.get('train_loss'),
-                    'train_acc': current.get('train_acc'),
-                    'val_metric': current.get('val_metric'),
-                    'val_roc_auc': current.get('val_roc_auc'),
-                    'train_ce': current.get('train_ce'),
-                    'train_mse': current.get('train_mse'),
-                    'train_grad_cos': current.get('train_grad_cos'),
-                    'val_reg_mae': current.get('val_reg_mae'),
-                })
-                current = {}
-
             i += 1
 
-        # Don't forget last epoch
-        if current.get('train_loss') is not None:
-            epochs.append({
-                'train_loss': current.get('train_loss'),
-                'train_acc': current.get('train_acc'),
-                'val_metric': current.get('val_metric'),
-                'val_roc_auc': current.get('val_roc_auc'),
-                'train_ce': current.get('train_ce'),
-                'train_mse': current.get('train_mse'),
-                'train_grad_cos': current.get('train_grad_cos'),
-                'val_reg_mae': current.get('val_reg_mae'),
-            })
+        # Flush the final epoch.
+        if current_epoch is not None and current.get('train_loss') is not None:
+            by_epoch[current_epoch] = current
+
+        # Some legacy logs lack `Epoch #N training` lines; fall back to
+        # positional indexing in that case so we don't drop those runs.
+        if not by_epoch and current.get('train_loss') is not None:
+            by_epoch[0] = current
     except Exception:
         pass
-    return epochs
+
+    return [
+        {'epoch': ep, **{k: v.get(k) for k in
+            ('train_loss', 'train_acc', 'val_metric', 'val_roc_auc',
+             'train_ce', 'train_mse', 'train_grad_cos', 'val_reg_mae')}}
+        for ep, v in sorted(by_epoch.items())
+    ]
+
+
+def _stitch_run_metrics(log_files):
+    """Merge per-epoch metrics across ALL log fragments of a run.
+
+    On requeue, each retry produces its own log file but continues from a
+    later epoch (via `--load-epoch`). The fragments together describe the
+    full run; we merge them by absolute epoch number, with later fragments
+    overriding earlier ones for any shared epoch (the later one is from
+    the most recent retry).
+    """
+    merged = {}
+    for lf in sorted(log_files):  # sort so newer fragments come last by mtime/timestamp prefix
+        for entry in _extract_metrics_from_log(lf):
+            merged[entry['epoch']] = entry
+    return [merged[k] for k in sorted(merged.keys())]
 
 
 def _extract_losses_from_log(filepath):
@@ -290,27 +305,34 @@ def parse_v2_runs(results_dir):
             else:
                 continue
 
-        # Find the log with the most epoch data
+        # Stitch all log fragments under this run dir (resumed runs produce
+        # multiple log files; each contains a contiguous chunk of epochs).
         log_files = sorted(glob.glob(os.path.join(run_dir, 'logs', '*.log.000')))
-        best_metrics = []
-        best_log = None
+        stitched = _stitch_run_metrics(log_files)
+
+        # Test-set metrics: take the latest log fragment that ran the test
+        # phase (newest timestamp wins).
+        test_info = {'test_metric': None, 'test_roc_auc': None}
+        for lf in sorted(log_files, reverse=True):
+            t = _extract_test_metrics_from_log(lf)
+            if t['test_metric'] is not None:
+                test_info = t
+                break
+
+        # Prefer the parameter count weaver actually logged (any fragment is fine).
+        params_log = None
         for lf in log_files:
-            metrics = _extract_metrics_from_log(lf)
-            if len(metrics) > len(best_metrics):
-                best_metrics = metrics
-                best_log = lf
-
-        # Test-set metrics: one number per run, attach to the LAST epoch.
-        test_info = _extract_test_metrics_from_log(best_log) if best_log else \
-                    {'test_metric': None, 'test_roc_auc': None}
-
-        # Prefer the actual parameter count weaver logged; fall back to lookup.
-        params_log = _params_M_from_log(best_log) if best_log else None
+            params_log = _params_M_from_log(lf)
+            if params_log is not None:
+                break
         params_M_value = params_log if params_log is not None else PARAMS_M.get(model, 0)
 
-        n_epochs = len(best_metrics)
-        for epoch_idx, m in enumerate(best_metrics):
-            is_last = (epoch_idx == n_epochs - 1)
+        if not stitched:
+            continue
+        max_epoch = max(e['epoch'] for e in stitched)
+        for m in stitched:
+            ep = m['epoch']
+            is_last = (ep == max_epoch)
             rows.append({
                 'model_size': model,
                 'data_budget': budget,
@@ -321,10 +343,10 @@ def parse_v2_runs(results_dir):
                 'task_type': task_type,
                 'params_M': params_M_value,
                 'num_epochs_cfg': num_epochs_cfg,
-                'epoch': epoch_idx,
+                'epoch': ep,
                 'samples_per_epoch': spe,
                 'ngpus': ngpus,
-                'total_samples_seen': spe * ngpus * (epoch_idx + 1),
+                'total_samples_seen': spe * ngpus * (ep + 1),
                 'train_loss': m['train_loss'],
                 'train_acc': m.get('train_acc'),
                 'val_metric': m.get('val_metric'),

@@ -320,6 +320,10 @@ echo "Restart count: $restarts"
 #   checkpoints -> RUN_DIR/checkpoints/net_epoch-N_state.pt
 #   text logs   -> RUN_DIR/logs/{auto}.log.000
 #   tensorboard -> RUN_DIR/tensorboard/  (absolute path -> log_dir, not runs/)
+# Disable -e around training so a non-zero weaver/torchrun exit (preemption,
+# OOM, transient NCCL failure) reaches the requeue path instead of killing
+# the script under `set -e`.
+set +e
 $CMD \
     --data-train "${DATA_TRAIN_ARGS[@]}" \
     --data-val "${DATA_VAL_ARGS[@]}" \
@@ -342,8 +346,8 @@ $CMD \
     --save-steps "${SAVE_STEPS:-200}" \
     "${RESUME_ARGS[@]}" \
     "${@:3}"
-
 TRAIN_EXIT_CODE=$?
+set -e
 
 # ---- Post-training summary (logged to SLURM stdout for easy parsing) ----
 echo ""

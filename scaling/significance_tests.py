@@ -145,29 +145,61 @@ def analyze_config(df, sample_type, run_type, fout):
     rows_r = t_table(popt_r, pcov_r,
                      ['B', 'beta', 'C', 'gamma', 'E'], n)
 
-    # Nested F-test: standard (k=5) inside cross (k=7)
-    k_s, k_x = 5, 7
-    df1 = k_x - k_s
-    df2 = n - k_x
-    if ssr_x > 0 and df2 > 0:
-        F = ((ssr_s - ssr_x) / df1) / (ssr_x / df2)
-        pF = 1.0 - stats.f.cdf(F, df1, df2)
-    else:
-        F, pF = np.nan, np.nan
-
+    # Nested-form comparison via PARAMETRIC BOOTSTRAP LRT.
+    # The naive F-test is invalid here: under H0:C=0 (or H0:A=0), the paired
+    # exponent (γ or α) is unidentified and C/A sit on a non-negativity
+    # bound, so the asymptotic F distribution does not apply. Instead we
+    # simulate the null distribution of the LR statistic directly:
+    #   LR = n * log(SSR_null / SSR_alt)
+    # by drawing y_b = chinchilla(N,D, *popt_null) + N(0, σ̂_null), refitting
+    # both forms on the synthetic data, and recording LR_b. The bootstrap
+    # p-value is the empirical fraction of LR_b ≥ LR_obs.
+    k_s, k_x, k_r = 5, 7, 5
     aic_s, bic_s = aic_bic(ssr_s, n, k_s)
     aic_x, bic_x = aic_bic(ssr_x, n, k_x)
-    k_r = 5
     aic_r, bic_r = aic_bic(ssr_r, n, k_r)
 
-    # Nested F-test: reduced (k=5) inside cross (k=7) — H0: A=α=0
-    df1_rx = k_x - k_r
-    df2_rx = n - k_x
-    if ssr_x > 0 and df2_rx > 0:
-        F_rx = ((ssr_r - ssr_x) / df1_rx) / (ssr_x / df2_rx)
-        pF_rx = 1.0 - stats.f.cdf(F_rx, df1_rx, df2_rx)
-    else:
-        F_rx, pF_rx = np.nan, np.nan
+    LR_sx = n * np.log(ssr_s / ssr_x) if ssr_x > 0 else np.nan
+    LR_rx = n * np.log(ssr_r / ssr_x) if ssr_x > 0 else np.nan
+
+    F = pF = F_rx = pF_rx = np.nan
+    if ssr_x > 0 and n > 7:
+        # Residual std of the standard fit (used as null for both tests since
+        # cross-term and reduced both nest inside the standard via different
+        # parameter constraints; using a common null fixes the noise scale.)
+        sigma_s = float(np.sqrt(ssr_s / max(1, n - k_s)))
+        sigma_r = float(np.sqrt(ssr_r / max(1, n - k_r)))
+        rng = np.random.default_rng(20260512)
+        B = 1000
+        boot_LR_sx = np.empty(B)
+        boot_LR_rx = np.empty(B)
+        for b in range(B):
+            # std-as-null bootstrap for std⊂cross
+            y_b = chinchilla((N, D), *popt_s) + rng.normal(0.0, sigma_s, size=n)
+            try:
+                ps_b, _ = curve_fit(chinchilla, (N, D), y_b, p0=p0_s, bounds=bd_s, maxfev=20000)
+                px_b, _ = curve_fit(chinchilla_cross, (N, D), y_b, p0=p0_x, bounds=bd_x, maxfev=20000)
+                ssr_s_b = float(np.sum((y_b - chinchilla((N, D), *ps_b))**2))
+                ssr_x_b = float(np.sum((y_b - chinchilla_cross((N, D), *px_b))**2))
+                boot_LR_sx[b] = n * np.log(ssr_s_b / ssr_x_b) if ssr_x_b > 0 else 0.0
+            except Exception:
+                boot_LR_sx[b] = 0.0
+            # reduced-as-null bootstrap for reduced⊂cross
+            y_b = chinchilla_reduced((N, D), *popt_r) + rng.normal(0.0, sigma_r, size=n)
+            try:
+                pr_b, _ = curve_fit(chinchilla_reduced, (N, D), y_b, p0=p0_r, bounds=bd_r, maxfev=20000)
+                px_b, _ = curve_fit(chinchilla_cross, (N, D), y_b, p0=p0_x, bounds=bd_x, maxfev=20000)
+                ssr_r_b = float(np.sum((y_b - chinchilla_reduced((N, D), *pr_b))**2))
+                ssr_x_b = float(np.sum((y_b - chinchilla_cross((N, D), *px_b))**2))
+                boot_LR_rx[b] = n * np.log(ssr_r_b / ssr_x_b) if ssr_x_b > 0 else 0.0
+            except Exception:
+                boot_LR_rx[b] = 0.0
+        # Bootstrap p-values (with +1 / B+1 correction so we never report exactly 0).
+        pF = float((np.sum(boot_LR_sx >= LR_sx) + 1) / (B + 1))
+        pF_rx = float((np.sum(boot_LR_rx >= LR_rx) + 1) / (B + 1))
+        # Report LR statistics in F's slot for printing compatibility.
+        F = float(LR_sx)
+        F_rx = float(LR_rx)
 
     # Bound-pinned warning: if a param sits exactly on a bound, t-stat is meaningless.
     pinned_x = []
@@ -211,14 +243,12 @@ def analyze_config(df, sample_type, run_type, fout):
               f"{r['t']:>9.3f} {fmt_p(r['p']):>10s}  {stars(r['p'])}",
               file=fout)
 
-    print(f"\n  Nested F-test (standard ⊂ cross-term):", file=fout)
-    print(f"    H0: C = 0 (cross-term carries no information)", file=fout)
-    print(f"    F({df1},{df2}) = {F:.3f},  p = {fmt_p(pF)}  {stars(pF)}",
-          file=fout)
-    print(f"  Nested F-test (reduced ⊂ cross-term):", file=fout)
-    print(f"    H0: A = 0 (pure-N term carries no information)", file=fout)
-    print(f"    F({df1_rx},{df2_rx}) = {F_rx:.3f},  p = {fmt_p(pF_rx)}  "
-          f"{stars(pF_rx)}", file=fout)
+    print(f"\n  Bootstrap LRT (standard ⊂ cross-term):  H0: C = 0", file=fout)
+    print(f"    LR = n·log(SSR_std/SSR_cross) = {F:.3f},  "
+          f"p_boot = {fmt_p(pF)}  {stars(pF)}  (B=1000)", file=fout)
+    print(f"  Bootstrap LRT (reduced ⊂ cross-term):  H0: A = 0", file=fout)
+    print(f"    LR = n·log(SSR_red/SSR_cross) = {F_rx:.3f},  "
+          f"p_boot = {fmt_p(pF_rx)}  {stars(pF_rx)}  (B=1000)", file=fout)
     dAIC = aic_x - aic_s
     dBIC = bic_x - bic_s
     dAIC_rs = aic_r - aic_s
@@ -270,7 +300,9 @@ def main():
             print("Significance tests for Chinchilla scaling-law fits", file=target)
             print(f"CSV: {args.csv}", file=target)
             print(f"Per-param: Wald t-stat = est/SE, two-sided.\n"
-                  "Nested F-test compares standard (5 params) vs cross-term (7 params).\n"
+                  "Cross-term significance via parametric bootstrap LRT (B=1000) — the\n"
+                  "naive F-test is invalid because C and A sit on the parameter bound\n"
+                  "under the null and the paired exponent is unidentified there.\n"
                   "Stars: *** p<0.001, ** p<0.01, * p<0.05, . p<0.10",
                   file=target)
         for st, rt in configs:

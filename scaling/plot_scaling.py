@@ -139,12 +139,13 @@ def select_epoch_data(df, epoch=None, metric='train_loss'):
 
     Returns df with 'D_M' column = total_samples_seen / 1e6 for that selection.
     """
-    # `task_type` is part of the run identity: a multitask run has different
-    # parameters and a different (uncertainty-weighted) train_loss than a
-    # singletask run with the same (size, budget, ...) and must not be merged.
+    # `run_type` (multi vs 1ep) and `task_type` (singletask vs multitask) are
+    # both part of the run identity. Merging across either silently mixes
+    # qualitatively different scaling regimes / loss definitions.
     group_keys = ['model_size', 'data_budget', 'sample_type', 'feature_type',
-                  'pair_tag', 'task_type'] if 'task_type' in df.columns else \
-                 ['model_size', 'data_budget', 'sample_type', 'feature_type', 'pair_tag']
+                  'pair_tag', 'run_type']
+    if 'task_type' in df.columns:
+        group_keys = group_keys + ['task_type']
 
     # Drop rows where the metric is NaN
     df = df.dropna(subset=[metric])
@@ -582,8 +583,9 @@ def main():
     # Exclude incomplete runs if requested
     if args.complete_only:
         group_keys = ['model_size', 'data_budget', 'sample_type', 'feature_type',
-                      'pair_tag', 'task_type'] if 'task_type' in df.columns else \
-                     ['model_size', 'data_budget', 'sample_type', 'feature_type', 'pair_tag']
+                      'pair_tag', 'run_type']
+        if 'task_type' in df.columns:
+            group_keys = group_keys + ['task_type']
         complete_mask = df.groupby(group_keys).apply(
             lambda g: g['epoch'].max() >= g['num_epochs_cfg'].iloc[0] - 1
         )
