@@ -142,6 +142,8 @@ CLAUDE*
 .claude*
 .codex*
 *pdf
+**png
+**PNG
 
 # Node / npm
 node_modules/
