@@ -290,6 +290,7 @@ def main():
         ('Herwig', 'multi'),
         ('Mixed',  'multi'),
         ('Pythia', '1ep'),
+        ('Herwig', '1ep'),
     ]
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     results = []

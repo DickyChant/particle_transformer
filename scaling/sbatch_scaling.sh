@@ -1,17 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=part-scaling
 #SBATCH --nodes=1
-#SBATCH --account=m2612
+#SBATCH --account=m3246
 #SBATCH --qos=regular
 #SBATCH --constraint=gpu
 #SBATCH --ntasks=1
-#SBATCH -G 4
+#SBATCH --gpus-per-node=4
 #SBATCH --time=12:00:00
-#SBATCH --module=cvmfs
-#SBATCH --open-mode=append
 #SBATCH --requeue
-#SBATCH --output=/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/slurm_logs/slurm-%j.out
-#SBATCH --error=/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/slurm_logs/slurm-%j.err
+#SBATCH --output=/pscratch/sd/y/ylo/part_scaling_output/slurm_logs/slurm-%j.out
+#SBATCH --error=/pscratch/sd/y/ylo/part_scaling_output/slurm_logs/slurm-%j.err
 
 # =============================================================================
 # Chinchilla Scaling Law Study v2 - Single Run Script
@@ -51,6 +49,8 @@ DATA_BUDGET="${2:?Error: data_budget required (5M/10M/25M/50M/100M/250M/500M)}"
 SAMPLE_TYPE="${SAMPLE_TYPE:-Pythia}"
 FEATURE_TYPE="${FEATURE_TYPE:-full}"
 PAIR_FEATURES="${PAIR_FEATURES:-1}"
+MODEL_CONFIG_DIR="${MODEL_CONFIG_DIR:-scaling/model_configs}"
+MODEL_VERSION="${MODEL_VERSION:-}"
 
 # ---- Validation ----
 case "$MODEL_SIZE" in
@@ -79,7 +79,7 @@ case "$PAIR_FEATURES" in
 esac
 
 # ---- Environment Setup ----
-REPO_DIR="/global/homes/s/sqian/jetclass_dir/particle_transformer"
+REPO_DIR="/global/cfs/cdirs/m3246/ylo/particle_transformer"
 cd "$REPO_DIR"
 
 export DDP_NGPUS=4
@@ -90,10 +90,11 @@ PAIR_TAG="pair"
 [[ "$PAIR_FEATURES" == "0" ]] && PAIR_TAG="nopair"
 EPOCH_TAG=""
 [[ -n "${NUM_EPOCHS:-}" ]] && EPOCH_TAG="_${NUM_EPOCHS}ep"
-RUN_NAME="${MODEL_SIZE}_${DATA_BUDGET}_${SAMPLE_TYPE}_${FEATURE_TYPE}_${PAIR_TAG}${EPOCH_TAG}"
+VERSION_TAG="${MODEL_VERSION:+_${MODEL_VERSION}}"
+RUN_NAME="${MODEL_SIZE}_${DATA_BUDGET}_${SAMPLE_TYPE}_${FEATURE_TYPE}_${PAIR_TAG}${EPOCH_TAG}${VERSION_TAG}"
 
 # ---- Timestamped run directory (preserved across requeueing) ----
-export OUTPUT_BASE="/pscratch/sd/s/sqian/part_training_output/scaling_study_v2"
+export OUTPUT_BASE="${SCRATCH}/part_scaling_output"
 mkdir -p "$OUTPUT_BASE/slurm_logs"
 
 TIMESTAMP_FILE="$OUTPUT_BASE/timestamps/TIMESTAMP_${SLURM_JOB_ID}"
@@ -182,10 +183,21 @@ function requeue () {
 
 # ---- Conda Environment ----
 module load conda
-conda activate weaver
+conda activate /global/cfs/cdirs/m3246/ylo/conda/part_transformer
+
+# ---- Performance & NCCL settings (Perlmutter) ----
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export NCCL_DEBUG=WARN
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_SOCKET_IFNAME=hsn
+export NCCL_NET_GDR_LEVEL=2
+export NCCL_TIMEOUT=7200
+export NCCL_BLOCKING_WAIT=1
 
 # ---- Dataset paths ----
-DATADIR="/pscratch/sd/s/sqian/part_datasets/JetClass"
+DATADIR="${JETCLASS_DIR:-/global/cfs/cdirs/m3246/ylo/sqian/particle_transformer/datasets/JetClass}"
 JET_CLASSES="HToBB HToCC HToGG HToWW2Q1L HToWW4Q TTBar TTBarLep WToQQ ZToQQ ZJetsToNuNu"
 
 DATA_TRAIN_ARGS=()
@@ -220,7 +232,7 @@ esac
 echo "Unique training samples: $UNIQUE_SAMPLES"
 
 # ---- Model Configuration ----
-network_config="scaling/model_configs/ParT_${MODEL_SIZE}.py"
+network_config="${MODEL_CONFIG_DIR}/ParT_${MODEL_SIZE}.py"
 
 case "$MODEL_SIZE" in
     nano|micro|tiny|small|base)
@@ -294,6 +306,8 @@ unique_samples: $UNIQUE_SAMPLES
 data_reuse: $DATA_REUSE
 ngpus: $NGPUS
 task_type: singletask
+model_config_dir: $MODEL_CONFIG_DIR
+model_version: ${MODEL_VERSION:-v1}
 EOF
 
 # ---- DDP Command ----
@@ -343,7 +357,6 @@ $CMD \
     --log "$RUN_DIR/logs/{auto}.log" \
     --predict-output pred.root \
     --tensorboard "$RUN_DIR/tensorboard" \
-    --save-steps "${SAVE_STEPS:-200}" \
     "${RESUME_ARGS[@]}" \
     "${@:3}"
 TRAIN_EXIT_CODE=$?
