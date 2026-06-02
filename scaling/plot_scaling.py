@@ -23,8 +23,8 @@ from scipy.optimize import curve_fit
 
 # ---- Constants ----
 
-DEFAULT_CSV = '/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/parsed_runs.csv'
-DEFAULT_OUTPUT_DIR = '/pscratch/sd/s/sqian/part_training_output/scaling_study_v2/plots'
+DEFAULT_CSV = '/pscratch/sd/y/ylo/part_scaling_output/parsed_runs_v2.csv'
+DEFAULT_OUTPUT_DIR = '/pscratch/sd/y/ylo/part_scaling_output/plots_v3'
 
 MODEL_SIZES = ['nano', 'micro', 'tiny', 'small', 'base', 'large', 'xlarge']
 DATA_BUDGETS = ['5M', '10M', '25M', '50M', '100M', '250M', '500M']
@@ -202,7 +202,7 @@ def make_predictions(popt, observed_df, epoch=None, metric='train_loss', increas
 
 
 def plot_scaling_pair(df, title_suffix, output_path, unique_samples, pred_df=None,
-                     metric='train_loss', increasing=False, transform=None):
+                     metric='train_loss', increasing=False, transform=None, excluded_models=None):
     """Two-panel: metric vs Data + metric vs Model Size, with optional predictions."""
     METRIC_LABELS = {
         'train_loss': 'Cross-Entropy Loss',
@@ -244,14 +244,17 @@ def plot_scaling_pair(df, title_suffix, output_path, unique_samples, pred_df=Non
     d_fit_range = np.logspace(np.log10(max(min(d_all) * 0.8, 0.5)),
                               np.log10(max(d_all) * 1.2), 50) if d_all else None
 
+    active_models = [m for m in MODEL_SIZES if not excluded_models or m not in excluded_models]
+
     # ---- Left: Loss vs Data ----
-    for model in MODEL_SIZES:
-        n_params = PARAMS_M[model]
+    for model in active_models:
         c = MODEL_COLORS.get(model, 'gray')
         sub = df[df['model_size'] == model].sort_values('D_M')
         has_data = not sub.empty
+        # Use actual params_M from data; fall back to hardcoded only if no data
+        n_params = sub['params_M'].iloc[0] if has_data else PARAMS_M[model]
 
-        label = f"{model} ({n_params:.2f}M)"
+        label = f"{model} ({n_params:.3f}M)"
         if has_data:
             reuse_mask = sub['total_samples_seen'] > unique_samples
             no_reuse = sub[~reuse_mask]
@@ -538,6 +541,9 @@ def main():
                              'Default: auto (log1mx for acc/AUC, none for loss).')
     parser.add_argument('--filter', nargs='+', default=None,
                         help='Filter: key=value pairs (e.g., sample_type=Pythia)')
+    parser.add_argument('--exclude-models', default=None,
+                        help='Comma-separated model sizes to exclude from data and fit lines '
+                             '(e.g., large,xlarge)')
     parser.add_argument('--predict', action='store_true',
                         help='Predict missing runs from fitted scaling law')
     parser.add_argument('--derived', action='store_true',
@@ -569,12 +575,21 @@ def main():
             df = df[df[key].astype(str) == val]
             print(f"  Filter {key}={val} -> {len(df)} rows")
 
+    # Exclude model sizes
+    excluded_models = []
+    if args.exclude_models:
+        excluded_models = [m.strip() for m in args.exclude_models.split(',')]
+        df = df[~df['model_size'].isin(excluded_models)]
+        print(f"  Excluded models {excluded_models} -> {len(df)} rows")
+
     # Build a suffix from filters for output naming
     filter_tag = ''
     if args.filter:
         for filt in args.filter:
             key, val = filt.split('=', 1)
             filter_tag += f'_{val}'
+    if excluded_models:
+        filter_tag += '_excl' + '-'.join(excluded_models)
 
     if df.empty:
         print("No data after filtering.")
@@ -666,7 +681,8 @@ def main():
                       .sort_values(['D_M', 'params_M']).to_string(index=False))
 
         popt, r2 = plot_scaling_pair(group, config_label, output_path, unique, pred_df=pred_df,
-                                     metric=metric, increasing=increasing, transform=transform)
+                                     metric=metric, increasing=increasing, transform=transform,
+                                     excluded_models=excluded_models)
 
         if popt is not None:
             fits[config_label] = {'popt': popt, 'r2': r2}
@@ -689,7 +705,8 @@ def main():
         plot_scaling_pair(selected, f'All configurations{epoch_label}',
                          os.path.join(args.output_dir, f'scaling_all{filter_tag}{metric_tag}{epoch_tag}.png'),
                          unique_samples=min(UNIQUE_SAMPLES.values()), metric=metric,
-                         increasing=increasing, transform=transform)
+                         increasing=increasing, transform=transform,
+                         excluded_models=excluded_models)
 
 
 if __name__ == '__main__':
