@@ -149,3 +149,5 @@ CLAUDE*
 node_modules/
 package.json
 package-lock.json
+
+actions
